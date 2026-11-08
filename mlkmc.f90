@@ -421,31 +421,31 @@ program mlkmc
     endif
 
     t2=mpi_wtime()
-    write(6,"(a)") "# Total wall time: "//print_time(t2-start_time)
-    write(6,"(a)") "#   Total KMC runtime: "//print_time(kmc%kmc_run_time)
-    write(6,"(a)") "#     Getting rates:     "//print_time(kmc%get_rates_time)
-    write(6,"(a)") "#       Overhead:          "//print_time(kmc%get_rates_overhead_time)
-    write(6,"(a)") "#       Finding events:    "//print_time(kmc%event_finding_time)
-    write(6,"(a)") "#       Create fingerprint:"//print_time(kmc%rate_fingerprint_time)
-    write(6,"(a)") "#       Check cache:       "//print_time(kmc%rate_cache_time)
-    write(6,"(a)") "#       Substr. LAE check: "//print_time(kmc%lae_sub_time)
-    write(6,"(a)") "#       Getting LAEs:      "//print_time(kmc%lae_time)
-    write(6,"(a)") "#         Init LAE:          "//print_time(kmc%lae_init_time)
-    write(6,"(a)") "#         Add atoms:         "//print_time(kmc%lae_add_time)
-    write(6,"(a)") "#         Calc connect:      "//print_time(kmc%lae_connect_time)
-    write(6,"(a)") "#       Descriptors:       "//print_time(kmc%desc_time)
-    write(6,"(a)") "#       Getting barriers:  "//print_time(kmc%get_barrier_time)
-    write(6,"(a)") "#         ML predictions:    "//print_time(kmc%predict_time)
-    write(6,"(a)") "#         ML fitting:        "//print_time(kmc%fit_time)
-    write(6,"(a)") "#         Minimizations:     "//print_time(kmc%minimize_time)
-    write(6,"(a)") "#         NEB calculations:  "//print_time(kmc%neb_barrier_time)
-    write(6,"(a)") "#       Assinging rates:   "//print_time(kmc%assigning_time)
-    write(6,"(a)") "#     Picking events:    "//print_time(kmc%pick_event_time)
-    write(6,"(a)") "#     Executing events:    "//print_time(kmc%execute_jump_event_time)
-    write(6,"(a)") "#       Create fingerprint:"//print_time(kmc%event_fingerprint_time)
-    write(6,"(a)") "#       Check cache:       "//print_time(kmc%event_cache_time)
-    write(6,"(a)") "#     Depositing atoms:  "//print_time(kmc%deposit_atom_time)
-    write(6,"(a)") "#     Writing to files:  "//print_time(kmc%write_time)
+    write(6,"(a)") "# Total wall time: "//trim(print_time(t2-start_time))
+    write(6,"(a)") "#   Total KMC runtime: "//trim(print_time(kmc%kmc_run_time))
+    write(6,"(a)") "#     Getting rates:     "//trim(print_time(kmc%get_rates_time))
+    write(6,"(a)") "#       Overhead:          "//trim(print_time(kmc%get_rates_overhead_time))
+    write(6,"(a)") "#       Finding events:    "//trim(print_time(kmc%event_finding_time))
+    write(6,"(a)") "#       Create fingerprint:"//trim(print_time(kmc%rate_fingerprint_time))
+    write(6,"(a)") "#       Check cache:       "//trim(print_time(kmc%rate_cache_time))
+    write(6,"(a)") "#       Substr. LAE check: "//trim(print_time(kmc%lae_sub_time))
+    write(6,"(a)") "#       Getting LAEs:      "//trim(print_time(kmc%lae_time))
+    write(6,"(a)") "#         Init LAE:          "//trim(print_time(kmc%lae_init_time))
+    write(6,"(a)") "#         Add atoms:         "//trim(print_time(kmc%lae_add_time))
+    write(6,"(a)") "#         Calc connect:      "//trim(print_time(kmc%lae_connect_time))
+    write(6,"(a)") "#       Descriptors:       "//trim(print_time(kmc%desc_time))
+    write(6,"(a)") "#       Getting barriers:  "//trim(print_time(kmc%get_barrier_time))
+    write(6,"(a)") "#         ML predictions:    "//trim(print_time(kmc%predict_time))
+    write(6,"(a)") "#         ML fitting:        "//trim(print_time(kmc%fit_time))
+    write(6,"(a)") "#         Minimizations:     "//trim(print_time(kmc%minimize_time))
+    write(6,"(a)") "#         NEB calculations:  "//trim(print_time(kmc%neb_barrier_time))
+    write(6,"(a)") "#       Assinging rates:   "//trim(print_time(kmc%assigning_time))
+    write(6,"(a)") "#     Picking events:    "//trim(print_time(kmc%pick_event_time))
+    write(6,"(a)") "#     Executing events:    "//trim(print_time(kmc%execute_jump_event_time))
+    write(6,"(a)") "#       Create fingerprint:"//trim(print_time(kmc%event_fingerprint_time))
+    write(6,"(a)") "#       Check cache:       "//trim(print_time(kmc%event_cache_time))
+    write(6,"(a)") "#     Depositing atoms:  "//trim(print_time(kmc%deposit_atom_time))
+    write(6,"(a)") "#     Writing to files:  "//trim(print_time(kmc%write_time))
   endif
 
   call lmp%close()
@@ -1209,6 +1209,10 @@ contains
     endif
     if (Z(1)<1) then
       write(0,"(a)") "*** Error: didn't find mandatory parameter Z in input file."
+      stop
+    endif
+    if (substrate_species<1) then
+      write(0,"(a)") "*** Error: didn't find mandatory parameter substrate_species in input file."
       stop
     endif
     if (temp<=0.0d0) then
