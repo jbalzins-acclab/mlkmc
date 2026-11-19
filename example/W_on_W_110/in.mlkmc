@@ -7,29 +7,29 @@
 
 # MANDATORY PARAMETERS
 # No default values are defined.
-pot_name          "CuAgAu.eam.fs" # Potential file name
-pot_style         "eam/fs"        # Potential style
-crystal           fcc             # Crystal structure: fcc, bcc or (limited to the 0001 substrate orientation) hcp
-orientation       111             # Substrate orientation: 100, 110 or 111 for fcc and bcc, 0001 for hcp
-lattice_constant  4.086           # Lattice constant in Å
+pot_name          "../../lammps/potentials/W_zhou.eam.alloy" # Potential file name
+pot_style         "eam/alloy"        # Potential style
+crystal           bcc             # Crystal structure: fcc, bcc or (limited to the 0001 substrate orientation) hcp
+orientation       110             # Substrate orientation: 100, 110 or 111 for fcc and bcc, 0001 for hcp
+lattice_constant  3.157           # Lattice constant in Å
 nZ                1               # Number of elements in the system
-Z                 47              # List of atomic numbers, e.g. 47 29
-substrate_species 47              # Substrate species
+Z                 74              # List of atomic numbers, e.g. 47 29
+substrate_species 74              # Substrate species
 T                 300.0           # System temperature in K
 attempt_frequency 1.25e12         # Arrhenius equation attempt frequency in Hz
 max_steps         100000          # Maximum steps in the simulation
-print_interval    10              # How often (every n steps) to print in terminal. Set to 0 for no printing
+print_interval    10            # How often (every n steps) to print in terminal. Set to 0 for no printing
 lae_cutoff_nth    4               # Local atomic environment (LAE) cutoff in terms of neighbour shells (4 => allow 4th nearest neighbour jumps). Mutually exclusive with lae_cutoff_dist
 max_jump_nth      3               # Longest allowed jump in terms of neighbour shells (4 => allow 4th nearest neighbour jumps). Mutually exclusive with max_jump_dist
 
 # ALTERNATIVE END CONDITIONS
-max_time          1.0e-3          # Maximum KMC time in the simulation (seconds). Set to 0 or leave commented to only restrict by other conditions
-max_wall_time     60400           # Maximum wall time (seconds). Set to 0 or leave commented to only restrict by other conditions. Default 604000 (~one week)
+max_time          1.0e5          # Maximum KMC time in the simulation (seconds). Set to 0 or leave commented to only restrict by other conditions
+max_wall_time     600           # Maximum wall time (seconds). Set to 0 or leave commented to only restrict by other conditions. Default 604000 (~one week)
 #max_height        16.0            # Maximum height of the system in Å. Leave commented to only restrict by other conditions.
 #min_height        14.5            # Minimum height of the system in Å. Leave commented to only restrict by other conditions.
 
 # ADDING ATOMS IN THE SYSTEM BEFORE STARTING KMC
-initial_atoms     random 10       # Place atoms randomly on the surface, equal to the integer argument
+#initial_atoms     random 1        # Place atoms randomly on the surface, equal to the integer argument
 #initial_atoms     hexagon 5       # Place a hexagon on the surface, with "atomic radius" equal to the integer argument
 #initial_atoms     hexagon_plus_adatom 5 # Place a hexagon on the surface, with "atomic radius" equal to the integer argument, and an additional adatom on top of it in the middle
 #initial_atoms     triangle 5 A    # Place a triangle on the surface, with "atomic radius" equal to the integer argument, terminated in A/B edges
@@ -39,7 +39,7 @@ initial_atoms     random 10       # Place atoms randomly on the surface, equal t
 # COMMON NON-MANDATORY PARAMETERS WITH DEFAULT VALUES
 # Default values should be sensible. Change any of these as necessary.
 verbosity         normal          # Verbosity; either silent, normal, loud or absurd. Default normal
-write_interval    1.0e-6          # How often (every x seconds) to do file I/O. Set to negative for no writing, set to 0.0 to write every frame. Default 0.0
+write_interval    1.0e2          # How often (every x seconds) to do file I/O. Set to negative for no writing, set to 0.0 to write every frame. Default 0.0
 restart_file      kmc.restart     # Restart file, read from and (over)written into. Default kmc.restart
 xyz_out           out.xyz         # Output xyz file. Default out.xyz
 allow_exchange    T               # Allow exchange events. Default T(rue)
@@ -59,8 +59,8 @@ neb_steps         1000            # Maximum number of NEB steps. Default 1000
 neb_spring        1.0             # NEB spring constant. Default 1.0
 neb_error         0.1             # Intrinsic error of NEB barriers in eV. Default value 0.1
 ml_tol            0.05            # Error estimate tolerance for accepting machine learning barriers in eV. Default 0.05
-dep_rate          0.0             # Deposition rate in monolayers/second for all elements in the system. Default 0.0 for all
-debug             F               # Debug flag for additional information and checks. Default F(alse)
+dep_rate          1.0e-5             # Deposition rate in monolayers/second for all elements in the system. Default 0.0 for all
+debug             T               # Debug flag for additional information and checks. Default F(alse)
 track_MSD         F               # Flag for tracking the mean square displacement of the first-deposited atom. Default F(alse)
 
 # ADVANCED NON-MANDATORY PARAMETERS

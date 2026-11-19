@@ -148,7 +148,7 @@ program mlkmc
               write(6,"(a)") "# Read Mersenne Twister state from mt.state, ignoring the seed parameter"
             endif
           else
-            write(6,"(a)") "# Read kmc.restart but can't find mt.state; reseeding Mersenne Twister"
+            write(6,"(a)") "# Read "//trim(restart_file)//" but can't find mt.state; reseeding Mersenne Twister"
             call seed_mt(seed)
           endif
 

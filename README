@@ -17,81 +17,136 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 Steps to install:
 
-1. $ git clone --recursive git@github.com:jyrikimari/mlkmc.git
-2. On desktop:
-   $ make
+  1. $ git clone --recursive git@github.com:jyrikimari/mlkmc.git
+  2. On desktop:
+     $ make
 
-   should be sufficient. The QUIP library will be built as
-   a part of compilation, and you will be prompted to make
-   choices in QUIP's make config. The default option should
-   work for everything EXCEPT
-   "Would you like to compile with GAP support ? [y/n]"
-   Here you should choose y instead of the default n.
+     should be sufficient. The QUIP library will be built as
+     a part of compilation, and you will be prompted to make
+     choices in QUIP's make config. The default option should
+     work for everything EXCEPT
+     "Would you like to compile with GAP support ? [y/n]"
+     Here you should choose y instead of the default n.
+
+     On clusters, you will need to load the appropriate modules
+     and build the appropriate target. Support currently extends
+     to the CSC Puhti cluster, the NSC Tetralith cluster,
+     and the Helsinki University Turso cluster federation.
+
+     When QUIP's make config prompts you to choose
+     "Would you like to compile with preconditioned minimisation support? (not working with Intel compiler) [y/n]",
+     it is most likely wise to choose n if you are using Intel
+     compiler, as instructed here for Puhti and Tetralith.
+
+     On Puhti:
+     $ module load intel-oneapi-compilers intel-oneapi-mpi intel-oneapi-mkl
+     $ make puhti
+
+     On Tetralith:
+     $ module load buildenv-intel/2023a-eb
+     $ make tetralith
+
+     On Turso:
+     $ module load OpenMPI OpenBLAS LAPACK
+     $ make turso
 
    The way LAMMPS is linked requires setting
    $ export LD_LIBRARY_PATH=/path/to/mlkmc/lammps/src:$LD_LIBRARY_PATH
    before running, both on desktop and on clusters.
 
-   On clusters, you will need to load the appropriate modules
-   and build the appropriate target. Support currently extends
-   to the CSC Puhti cluster, the NSC Tetralith cluster,
-   and the Helsinki University Turso cluster federation.
-
-   When QUIP's make config prompts you to choose
-   "Would you like to compile with preconditioned minimisation support? (not working with Intel compiler) [y/n]",
-   it is most likely wise to choose n if you are using Intel
-   compiler, as instructed here for Puhti and Tetralith.
-
-   On Puhti:
-   $ module load intel-oneapi-compilers intel-oneapi-mpi intel-oneapi-mkl
-   $ make puhti
-
-   On Tetralith:
-   $ module load buildenv-intel/2023a-eb
-   $ make tetralith
-
-   On Turso:
-   $ module load OpenMPI OpenBLAS LAPACK
-   $ make turso
-
 Running on desktop (mainly for testing/developing):
 
-   You need an in.mlkmc file in the working directory (example
-   provided), and a LAMMPS style interatomic potential energy
-   function in the place indicated in in.mlkmc. Then, if
-   the mlkmc directory have been added to your PATH, to run:
-   $ mpirun -n 11 --oversubscribe mlkmc
+  You need an in.mlkmc file in the working directory (examples
+  provided), and a LAMMPS style interatomic potential energy
+  function in the place indicated in in.mlkmc. Then, if
+  the mlkmc directory have been added to your PATH, to run:
+  $ mpirun -n 11 --oversubscribe mlkmc
 
-   The number of MPI tasks, here 11, is equal to the default number
-   of NEB replicas in the barrier calculations. If you change
-   the parameter neb_images in in.mlkmc, change the number of
-   mpirun -n parameter accordingly. On a desktop, you most likely
-   need the --oversubscribe flag to have enough "cores" available.
+  The number of MPI tasks, here 11, is equal to the default number
+  of NEB replicas in the barrier calculations. If you change
+  the parameter neb_images in in.mlkmc, change the number of
+  mpirun -n parameter accordingly. On a desktop, you most likely
+  need the --oversubscribe flag to have enough "cores" available.
 
-   On a desktop, you may want to direct stdout to a file, by e.g.
-   $ mpirun -n 11 --oversubscribe mlkmc | tee mlkmc.out
+  On a desktop, you may want to direct stdout to a file, by e.g.
+  $ mpirun -n 11 --oversubscribe mlkmc | tee mlkmc.out
 
 Running on clusters:
 
-   In the sbatch script, set -N 1, --ntasks-per-node=11 and --cpus-per-task=1.
-   Then (again if mlkmc can be found in your PATH), include the following commands
-   in the script, depending on the platform.
+  In the sbatch script, set -N 1, --ntasks-per-node=11 and --cpus-per-task=1.
+  Then (again if mlkmc can be found in your PATH), include the following commands
+  in the script, depending on the platform.
 
-   On Puhti:
-   module load intel-oneapi-compilers intel-oneapi-mpi intel-oneapi-mkl
-   ulimit -Ss unlimited
-   srun mlkmc
+  On Puhti:
+  module load intel-oneapi-compilers intel-oneapi-mpi intel-oneapi-mkl
+  ulimit -Ss unlimited
+  srun mlkmc
 
-   On Tetralith:
-   module load buildenv-intel/2023a-eb
-   ulimit -Ss unlimited
-   srun mlkmc
+  On Tetralith:
+  module load buildenv-intel/2023a-eb
+  ulimit -Ss unlimited
+  srun mlkmc
 
-   On Turso:
-   module load OpenMPI OpenBLAS LAPACK
-   srun --mpi=pmix mlkmc
+  On Turso:
+  module load OpenMPI OpenBLAS LAPACK
+  srun --mpi=pmix mlkmc
+
+Running the examples:
+
+  Examples are included for simulating diffusion and deposition
+  of Ag and CuAgAu on the Ag {111} substrate in examples/Ag_111/,
+  and deposition of W on W {110} substrate in examples/W_on_W_110/.
+  Each simulation is limited to 10 minutes of wall time in
+  the input file. In each run, the program will either
+  generate the initial substrate system as instructed in in.mlkmc,
+  or read an initial.system file if present. The output is a
+  log in stdout, an out.xyz file of the simulation, and a
+  predictors/ directory with the collection of barrier data
+  points and ML models as they existed at the end of the
+  simulation. Additionally, intermediate and final restart
+  files are written.
+
+  Ag_111:
+
+    These simulations require the CuAgAu.eam.fs potential file
+    which can be downloaded from
+    https://www.ctcms.nist.gov/potentials/entry/1990--Ackland-G-J-Vitek-V--Cu-Ag-Au/.
+    The simulations are set up to read the same copy of the
+    file from examples/Ag_111/ (i.e., there's no need to make
+    a separate copy in each subdirectory).
+
+    Ag_diffusion:
+      Place one random Ag atom on Ag {111} at 300 K and track its
+      mean square displacement throughout the simulation.
+      Will only execute one NEB calculation, so the simulation
+      runs quite fast. The  predictors/ directory will have a
+      file named hop_predictor_3_3_1.xml that holds the result of the
+      NEB run for terrace diffusion.
+
+    Ag_deposition:
+      You may copy the predictors/ directory and initial.system
+      from the previous simulation to speed up the startup.
+      The simulation will deposit Ag atoms on Ag {111} at 300 K
+      at a rate of 10^5 monolayers/s.
+
+    CuAgAu_deposition:
+      Since the previous simulations were initialised to
+      only include Ag atoms, the initial.system and the predictors/
+      directory are not reusable here. This simulation will
+      concurrently deposit Cu atoms at a rate of 3*10^4 monolayers/s,
+      Ag at 4*10^3 monolayers/s, and Au at 3*10^4 monolayers/s
+      at 300 K.
+
+  W_on_W_110:
+
+      This simulation will read the W_zhou.eam.alloy in
+      lammps/potentials, which is part of the LAMMPS submodule
+      installation. No need to make a copy.
+
+      This simulation will deposit W atoms on the W {110} surface
+      at 300 K at a rate of 10^(-5) monolayers/s.
 
 Cite as:
 
-   Kimari, J., Djurabekova, F., & Sarakinos, K. (2026). A Self-Evolving Machine-Learning-Based
-   Kinetic Monte Carlo Method for Modelling Thin-Film Growth. https://doi.org/10.48550/arXiv.2605.31144
+  Kimari, J., Djurabekova, F., & Sarakinos, K. (2026). A Self-Evolving Machine-Learning-Based
+  Kinetic Monte Carlo Method for Modelling Thin-Film Growth. https://doi.org/10.48550/arXiv.2605.31144
