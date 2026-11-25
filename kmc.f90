@@ -92,7 +92,9 @@ contains
     double precision :: t1,t2,dump_t1
     integer :: final_site,initial_site,nn_atom,shell,jump_shell,atom_type
     double precision :: u,dt,elapsed_time,wall_time_interval
-    integer :: mpi_error,internal_error,write_error
+    integer :: mpi_error,internal_error,write_error,worker_cmd,idx
+    type(t_atoms) :: dummy_atoms
+    double precision :: dummy_b1,dummy_b2
     logical :: end_loop
 
     if (present(error)) then
@@ -147,238 +149,257 @@ contains
       return
     endif
 
-    elapsed_time=0.0d0
-    end_loop=.false.
-    do step=first_step+1,max_steps
-      if (myrank==0) then
-        kmc%step=step
-        t1=mpi_wtime()
-      endif
-      call get_rates(kmc,lmp,myrank,error=internal_error)
-      if (myrank==0) then
-        t2=mpi_wtime()
-        kmc%get_rates_time=kmc%get_rates_time+t2-t1
-        if (internal_error/=0) then
-          write(0,"(a)") "*** Error when calculating rates in run_kmc()"
+    ! Workers only participate in neb_barrier(); keep them parked on a single
+    ! mpi_bcast instead of broadcasting 12+ per-step KMC flags when no NEB runs.
+    if (myrank/=0) then
+      do
+        call mpi_bcast(worker_cmd,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
+        if (worker_cmd==0) then
+          exit
         endif
+        call neb_barrier(kmc,lmp,0,0,dummy_atoms,dummy_b1,dummy_b2,myrank)
+      end do
+      call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
+      if (internal_error/=0) then
+        if (present(error)) then
+          error=internal_error
+        endif
+        call mpi_barrier(mpi_comm_world,mpi_error)
+        return
       endif
       call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
       if (internal_error/=0) then
-        exit
-      endif
-      if (myrank==0) then
-        if (kmc%total_rate<=0.0_rk) then
-          write(0,"(a,i0,a)") "*** Warning: no valid events found at step ",step,"!"
-          internal_error=1
+        if (present(error)) then
+          error=internal_error
         endif
       endif
-      call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-      if (internal_error/=0) then
-        internal_error=0
-        exit
-      endif
-      if (myrank==0) then
-        t1=mpi_wtime()
-        call pick_event(kmc,i,a,b,event_type,error=internal_error)
-        t2=mpi_wtime()
-        kmc%pick_event_time=kmc%pick_event_time+t2-t1
-        if (internal_error/=0) then
-          write(0,"(a,i0,a)") "*** Error: failed to pick event at step ",step," in run_kmc()"
-          call write_output_line(kmc,error=write_error)
-          if (write_error/=0) then
-            write(0,"(a)") "*** Warning: error writing output line"
-          endif
-        endif
-      endif
-      call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-      if (internal_error/=0) then
-        exit
-      endif
-      if (myrank==0) then
-        u=genrand64_real2()
-        dt=-log(u)/kmc%total_rate
-        kmc%time=kmc%time+dt
-        elapsed_time=elapsed_time+dt
+      return
+    endif
 
-        if (event_type==EVENT_TYPE_HOP) then
-          nn_atom=a
-          shell=b
-          jump_shell=NN_SHELL_TO_JUMP_SHELL(shell,kmc%system%crystal_structure)
-          if (jump_shell<=0) then
-            write(0,"(a,i0,a)") "*** Error: invalid shell ",shell," doesn't map to an allowed jump_shell in run_kmc()"
-            internal_error=1
-          endif
-        endif
-        if (internal_error==0) then
-          t1=mpi_wtime()
-          if (event_type==EVENT_TYPE_HOP) then
-            kmc%last_barrier=kmc%system%sites(i)%hop_barriers(1,nn_atom,jump_shell)
-            call execute_jump_event(kmc,i,nn_atom,shell,event_type,error=internal_error)
-            t2=mpi_wtime()
-            kmc%execute_jump_event_time=kmc%execute_jump_event_time+t2-t1
-          elseif (event_type==EVENT_TYPE_EXCHANGE) then
-            final_site=a
-            initial_site=b
-            kmc%last_barrier=kmc%system%sites(i)%exchange_barriers(1,final_site,initial_site)
-            call execute_jump_event(kmc,i,final_site,initial_site,event_type,error=internal_error)
-            t2=mpi_wtime()
-            kmc%execute_jump_event_time=kmc%execute_jump_event_time+t2-t1
-          elseif (event_type==EVENT_TYPE_DEPOSITION) then
-            atom_type=a
-            kmc%steps_since_deposition_or_rate_lowering=0
-            kmc%rate_lowered_times=0
-            call add_atom_random(kmc%system,kmc%Z(atom_type),atom_type,verbosity=kmc%verbosity,error=internal_error)
-            t2=mpi_wtime()
-            kmc%deposit_atom_time=kmc%deposit_atom_time+t2-t1
-          else ! Event type none; error
-            write(0,"(a)") "*** Error: no event type to execute in run_kmc()"
-            internal_error=1
-          endif
-          if (internal_error==0) then
-            if (kmc%system%crystal_structure==CRYSTAL_STRUCTURE_CLOSE_PACKED) then
-              where(.not. kmc%system%sites(1:kmc%system%n_sites)%initial_site .and. &
-                  (kmc%system%sites(1:kmc%system%n_sites)%Z<0 .or. kmc%system%sites(1:kmc%system%n_sites)%n_near>1))
-                kmc%system%sites(1:kmc%system%n_sites)%inactive_counter=kmc%system%sites(1:kmc%system%n_sites)%inactive_counter+1
-              end where
-            endif
-          endif
-        else
-          if (event_type==EVENT_TYPE_HOP) then
-            write(0,"(a)") "*** Error: could not execute hop event from site ",i," in run_kmc()"
-          elseif (event_type==EVENT_TYPE_EXCHANGE) then
-            write(0,"(a)") "*** Error: could not execute exchange event about site ",i," in run_kmc()"
-          elseif (event_type==EVENT_TYPE_DEPOSITION) then
-            write(0,"(a)") "*** Error: could not execute deposition event in run_kmc()"
-          else
-            write(0,"(a)") "*** Error: no event type to execute in run_kmc()"
-            internal_error=1
-          endif
-          call write_output_line(kmc,error=write_error)
-          if (write_error/=0) then
-            write(0,"(a)") "*** Warning: error writing output line"
-          endif
-        endif
-      endif
-      call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-      if (internal_error/=0) then
-        exit
-      endif
-      if (myrank==0) then
-        if (kmc%system%crystal_structure==CRYSTAL_STRUCTURE_CLOSE_PACKED) then
-          if (mod(step,INACTIVE_DELETION_INTERVAL)==0) then
-            n_deleted=delete_inactive_sites(kmc%system,error=internal_error)
-            if (internal_error==0) then
-              if (kmc%verbosity>VERBOSITY_NORMAL) then
-                write(6,"(a,i0,a,i0)") "# Deleted ",n_deleted," inactive sites at step ",step
-              endif
-              if (kmc%debug) then
-                call check_validity(kmc%system,verbosity=kmc%verbosity,error=internal_error)
-                if (internal_error/=0) then
-                  write(0,"(a,i0,a,i0,a)") "*** ",internal_error,&
-                                           " errors detected in check_validity() at step ",step," in run_kmc()"
-                endif
-              endif
-            else
-              write(0,"(a,i0,a)") "*** Error deleting inactive sites at step ",step," in run_kmc()"
-            endif
-          endif
-        endif
-        if (internal_error==0) then
-          if (print_interval>0) then
-            if (mod(step,print_interval)==0) then
-              call write_output_line(kmc,error=write_error)
-              if (write_error/=0) then
-                write(0,"(a)") "*** Warning: error writing output line"
-              endif
-            endif
-          endif
-        endif
-      endif
-      call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-      if (internal_error/=0) then
-        exit
-      endif
-      if (myrank==0) then
-        if (write_interval>=0) then
-          if (elapsed_time>=write_interval) then
-            if (kmc%verbosity>=VERBOSITY_QUIET) then
-              write(6,"(a)",advance="no") "# Writing xyz frame..."
-            endif
-            elapsed_time=0.0_rk
-            t1=mpi_wtime()
-            call print_xyz_frame(kmc%system,kmc%time,kmc%step,fileunit,debug=kmc%debug,error=internal_error)
-            if (internal_error/=0) then
-              write(0,"(a)") "*** Error writing atoms xyz in run_kmc()"
-            endif
-            t2=mpi_wtime()
-            kmc%write_time=kmc%write_time+t2-t1
-            if (kmc%verbosity>=VERBOSITY_QUIET) then
-              write(6,"(a)") " done"
-            endif
-          endif
-        endif
-      endif
-      call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-      if (internal_error/=0) then
-        exit
-      endif
-
-      if (myrank==0) then
-        if (max_time>0) then
-          if (kmc%time>=max_time) then
-            if (kmc%verbosity>=VERBOSITY_QUIET) then
-              write(6,"(a)") "# Reached the maximum allowed KMC time"
-            endif
-            call write_output_line(kmc,error=write_error)
-            if (write_error/=0) then
-              write(0,"(a)") "*** Warning: error writing output line"
-            endif
-            end_loop=.true.
-          endif
-        endif
-        if (internal_error==0 .and. .not. end_loop) then
-          if (kmc%system%height>=max_height .or. kmc%system%height<=min_height) then
-            if (kmc%verbosity>=VERBOSITY_QUIET) then
-              write(6,"(a)") "# Reached the minimum/maximum system height"
-            endif
-            call write_output_line(kmc,error=write_error)
-            if (write_error/=0) then
-              write(0,"(a)") "*** Warning: error writing output line"
-            endif
-            end_loop=.true.
-          endif
-        endif
-        if (internal_error==0 .and. .not. end_loop .and. max_wall_time>0) then
-          t2=mpi_wtime()
-          if (t2-dump_t1>wall_time_interval) then
-            write(6,"(a)",advance="no") "# Reached (another) tenth of maximum wall time, dumping intermediate data..."
-            call dump_data_intermediate(kmc,error=internal_error)
-            write(6,"(a)") " done"
-            dump_t1=mpi_wtime()
-          endif
-          if (internal_error==0) then
-            if (t2-start_time>max_wall_time) then
-              if (kmc%verbosity>=VERBOSITY_QUIET) then
-                write(6,"(a)") "# Reached the maximum allowed wall time"
-              endif
-              call write_output_line(kmc,error=write_error)
-              if (write_error/=0) then
-                write(0,"(a)") "*** Warning: error writing output line"
-              endif
-              end_loop=.true.
-            endif
-          endif
-        endif
-      endif
-      call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-      if (internal_error/=0) then
-        exit
-      endif
-      call mpi_bcast(end_loop,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_error)
-      if (end_loop) then
+    ! Locate lowest site index that can satisfy inactive_counter increment:
+    ! substrate sites (1..n_substrate) default to initial_site=.false. even though
+    ! Z>0 and n_near==0, while add_adsorption_sites marks initial adsorption sites .true.
+    kmc%system%first_dynamic_site=kmc%system%n_sites+1
+    do i=1,kmc%system%n_substrate
+      if (.not. kmc%system%sites(i)%initial_site .and. &
+          (kmc%system%sites(i)%Z<0 .or. kmc%system%sites(i)%n_near>1)) then
+        kmc%system%first_dynamic_site=i
         exit
       endif
     end do
+    if (kmc%system%first_dynamic_site>kmc%system%n_sites) then
+      do i=kmc%system%n_substrate+1,kmc%system%n_sites
+        if (.not. kmc%system%sites(i)%initial_site) then
+          kmc%system%first_dynamic_site=i
+          exit
+        endif
+      end do
+    endif
+
+    elapsed_time=0.0d0
+    end_loop=.false.
+    do step=first_step+1,max_steps
+      kmc%step=step
+      t1=mpi_wtime()
+      call get_rates(kmc,lmp,myrank,error=internal_error)
+      t2=mpi_wtime()
+      kmc%get_rates_time=kmc%get_rates_time+t2-t1
+      if (internal_error/=0) then
+        write(0,"(a)") "*** Error when calculating rates in run_kmc()"
+        exit
+      endif
+      if (kmc%total_rate<=0.0_rk) then
+        write(0,"(a,i0,a)") "*** Warning: no valid events found at step ",step,"!"
+        exit
+      endif
+      t1=mpi_wtime()
+      call pick_event(kmc,i,a,b,event_type,error=internal_error)
+      t2=mpi_wtime()
+      kmc%pick_event_time=kmc%pick_event_time+t2-t1
+      if (internal_error/=0) then
+        write(0,"(a,i0,a)") "*** Error: failed to pick event at step ",step," in run_kmc()"
+        call write_output_line(kmc,error=write_error)
+        if (write_error/=0) then
+          write(0,"(a)") "*** Warning: error writing output line"
+        endif
+        exit
+      endif
+      u=genrand64_real2()
+      dt=-log(u)/kmc%total_rate
+      kmc%time=kmc%time+dt
+      elapsed_time=elapsed_time+dt
+
+      if (event_type==EVENT_TYPE_HOP) then
+        nn_atom=a
+        shell=b
+        jump_shell=NN_SHELL_TO_JUMP_SHELL(shell,kmc%system%crystal_structure)
+        if (jump_shell<=0) then
+          write(0,"(a,i0,a)") "*** Error: invalid shell ",shell," doesn't map to an allowed jump_shell in run_kmc()"
+          internal_error=1
+        endif
+      endif
+      if (internal_error==0) then
+        t1=mpi_wtime()
+        if (event_type==EVENT_TYPE_HOP) then
+          kmc%last_barrier=kmc%system%sites(i)%hop_barriers(1,nn_atom,jump_shell)
+          call execute_jump_event(kmc,i,nn_atom,shell,event_type,error=internal_error)
+          t2=mpi_wtime()
+          kmc%execute_jump_event_time=kmc%execute_jump_event_time+t2-t1
+        elseif (event_type==EVENT_TYPE_EXCHANGE) then
+          final_site=a
+          initial_site=b
+          kmc%last_barrier=kmc%system%sites(i)%exchange_barriers(1,final_site,initial_site)
+          call execute_jump_event(kmc,i,final_site,initial_site,event_type,error=internal_error)
+          t2=mpi_wtime()
+          kmc%execute_jump_event_time=kmc%execute_jump_event_time+t2-t1
+        elseif (event_type==EVENT_TYPE_DEPOSITION) then
+          atom_type=a
+          kmc%steps_since_deposition_or_rate_lowering=0
+          kmc%rate_lowered_times=0
+          call add_atom_random(kmc%system,kmc%Z(atom_type),atom_type,verbosity=kmc%verbosity,error=internal_error)
+          t2=mpi_wtime()
+          kmc%deposit_atom_time=kmc%deposit_atom_time+t2-t1
+        else ! Event type none; error
+          write(0,"(a)") "*** Error: no event type to execute in run_kmc()"
+          internal_error=1
+        endif
+        if (internal_error==0) then
+          if (kmc%system%crystal_structure==CRYSTAL_STRUCTURE_CLOSE_PACKED) then
+            ! Scan only dynamic sites (>= first_dynamic_site) instead of all n_sites
+            do idx=kmc%system%first_dynamic_site,kmc%system%n_sites
+              if (.not. kmc%system%sites(idx)%initial_site .and. &
+                  (kmc%system%sites(idx)%Z<0 .or. kmc%system%sites(idx)%n_near>1)) then
+                kmc%system%sites(idx)%inactive_counter=kmc%system%sites(idx)%inactive_counter+1
+              endif
+            end do
+          endif
+        endif
+      else
+        if (event_type==EVENT_TYPE_HOP) then
+          write(0,"(a)") "*** Error: could not execute hop event from site ",i," in run_kmc()"
+        elseif (event_type==EVENT_TYPE_EXCHANGE) then
+          write(0,"(a)") "*** Error: could not execute exchange event about site ",i," in run_kmc()"
+        elseif (event_type==EVENT_TYPE_DEPOSITION) then
+          write(0,"(a)") "*** Error: could not execute deposition event in run_kmc()"
+        else
+          write(0,"(a)") "*** Error: no event type to execute in run_kmc()"
+          internal_error=1
+        endif
+        call write_output_line(kmc,error=write_error)
+        if (write_error/=0) then
+          write(0,"(a)") "*** Warning: error writing output line"
+        endif
+      endif
+      if (internal_error/=0) then
+        exit
+      endif
+      if (kmc%system%crystal_structure==CRYSTAL_STRUCTURE_CLOSE_PACKED) then
+        if (mod(step,INACTIVE_DELETION_INTERVAL)==0) then
+          n_deleted=delete_inactive_sites(kmc%system,error=internal_error)
+          if (internal_error==0) then
+            if (kmc%verbosity>VERBOSITY_NORMAL) then
+              write(6,"(a,i0,a,i0)") "# Deleted ",n_deleted," inactive sites at step ",step
+            endif
+            if (kmc%debug) then
+              call check_validity(kmc%system,verbosity=kmc%verbosity,error=internal_error)
+              if (internal_error/=0) then
+                write(0,"(a,i0,a,i0,a)") "*** ",internal_error,&
+                                         " errors detected in check_validity() at step ",step," in run_kmc()"
+              endif
+            endif
+          else
+            write(0,"(a,i0,a)") "*** Error deleting inactive sites at step ",step," in run_kmc()"
+          endif
+        endif
+      endif
+      if (internal_error==0) then
+        if (print_interval>0) then
+          if (mod(step,print_interval)==0) then
+            call write_output_line(kmc,error=write_error)
+            if (write_error/=0) then
+              write(0,"(a)") "*** Warning: error writing output line"
+            endif
+          endif
+        endif
+      endif
+      if (internal_error/=0) then
+        exit
+      endif
+      if (write_interval>=0) then
+        if (elapsed_time>=write_interval) then
+          if (kmc%verbosity>=VERBOSITY_QUIET) then
+            write(6,"(a)",advance="no") "# Writing xyz frame..."
+          endif
+          elapsed_time=0.0_rk
+          t1=mpi_wtime()
+          call print_xyz_frame(kmc%system,kmc%time,kmc%step,fileunit,debug=kmc%debug,error=internal_error)
+          if (internal_error/=0) then
+            write(0,"(a)") "*** Error writing atoms xyz in run_kmc()"
+          endif
+          t2=mpi_wtime()
+          kmc%write_time=kmc%write_time+t2-t1
+          if (kmc%verbosity>=VERBOSITY_QUIET) then
+            write(6,"(a)") " done"
+          endif
+        endif
+      endif
+      if (internal_error/=0) then
+        exit
+      endif
+
+      if (max_time>0) then
+        if (kmc%time>=max_time) then
+          if (kmc%verbosity>=VERBOSITY_QUIET) then
+            write(6,"(a)") "# Reached the maximum allowed KMC time"
+          endif
+          call write_output_line(kmc,error=write_error)
+          if (write_error/=0) then
+            write(0,"(a)") "*** Warning: error writing output line"
+          endif
+          end_loop=.true.
+        endif
+      endif
+      if (internal_error==0 .and. .not. end_loop) then
+        if (kmc%system%height>=max_height .or. kmc%system%height<=min_height) then
+          if (kmc%verbosity>=VERBOSITY_QUIET) then
+            write(6,"(a)") "# Reached the minimum/maximum system height"
+          endif
+          call write_output_line(kmc,error=write_error)
+          if (write_error/=0) then
+            write(0,"(a)") "*** Warning: error writing output line"
+          endif
+          end_loop=.true.
+        endif
+      endif
+      if (internal_error==0 .and. .not. end_loop .and. max_wall_time>0) then
+        t2=mpi_wtime()
+        if (t2-dump_t1>wall_time_interval) then
+          write(6,"(a)",advance="no") "# Reached (another) tenth of maximum wall time, dumping intermediate data..."
+          call dump_data_intermediate(kmc,error=internal_error)
+          write(6,"(a)") " done"
+          dump_t1=mpi_wtime()
+        endif
+        if (internal_error==0) then
+          if (t2-start_time>max_wall_time) then
+            if (kmc%verbosity>=VERBOSITY_QUIET) then
+              write(6,"(a)") "# Reached the maximum allowed wall time"
+            endif
+            call write_output_line(kmc,error=write_error)
+            if (write_error/=0) then
+              write(0,"(a)") "*** Warning: error writing output line"
+            endif
+            end_loop=.true.
+          endif
+        endif
+      endif
+      if (internal_error/=0 .or. end_loop) then
+        exit
+      endif
+    end do
+
+    worker_cmd=0
+    call mpi_bcast(worker_cmd,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
+    call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
 
     if (internal_error/=0) then
       if (present(error)) then
@@ -535,137 +556,113 @@ contains
     integer :: max_jump_shell,max_nn,max_1nn,nn_id,nn_nn_id
     integer :: crystal_structure
     integer :: n_neighbour_sites(NN_SHELLS),fingerprint(kmc%nZ,0:NN_SHELLS),minim_result
-    integer,allocatable :: nn_tmp(:)
-    integer,allocatable :: n_near_tmp(:)
-    logical,allocatable :: site_blocked(:)
+    ! Persistent scratch buffers avoid per-step n_sites (~80k) allocations and copies
+    logical,allocatable,save :: site_blocked(:)
+    integer,allocatable,save :: blocked_sites(:),dep_sorted(:)
+    integer,allocatable,save :: hop_event_states(:,:),exchange_event_states(:,:)
+    integer :: n_blocked,k_dep,dep_key,j_dep,s_chk,k_chk,needed_cap
+    logical,allocatable :: tmp_blocked(:)
+    integer,allocatable :: tmp_idx(:)
+    real(kind=rk) :: hop_sum,exch_sum
     logical :: jumps_checked,allow_exchange
-    integer,allocatable :: hop_event_states(:,:),exchange_event_states(:,:)
-    type(t_atoms) :: initial_config,final_config
+    type(t_atoms) :: initial_config
     logical,pointer :: jumping_ptr(:)
-  
+
     type(Atoms) :: lae
     type(descriptor_data) :: desc_forward,desc_reverse
     integer :: mpi_error
-  
+
     if (present(error)) then
       error=0
     endif
     internal_error=0
-  
-    if (myrank==0) then
-      if (.not. kmc%initialised) then
-        write(0,"(a)") "*** Error: kmc not initialised before get_rates()"
-      endif
-      t1=mpi_wtime()
-    endif
-    call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-    if (internal_error/=0) then
+
+    if (.not. kmc%initialised) then
+      write(0,"(a)") "*** Error: kmc not initialised before get_rates()"
+      internal_error=1
       if (present(error)) then
         error=internal_error
       endif
       return
     endif
-  
-    if (myrank==0) then
-      allocate(nn_tmp(kmc%system%n_sites))
-      allocate(n_near_tmp(kmc%system%n_sites))
-      allocate(site_blocked(kmc%system%n_sites))
 
-      initial_config=get_atoms(kmc%system)
+    t1=mpi_wtime()
+    ! Defer get_atoms() copy until get_barrier() actually needs minim/NEB coordinates
+    initial_config%initialised=.false.
+    n_blocked=0
 
-      crystal_structure=kmc%system%crystal_structure
-
-      max_nn=kmc%system%max_nn
-      max_1nn=kmc%system%max_1nn
-      max_jump_shell=kmc%system%max_jump_shell
-      allow_exchange=kmc%system%allow_exchange
+    if (.not. allocated(site_blocked)) then
+      needed_cap=max(kmc%system%n_sites+1024,1024)
+      allocate(site_blocked(needed_cap))
+      allocate(blocked_sites(needed_cap))
+      site_blocked=.false.
+    elseif (size(site_blocked)<kmc%system%n_sites) then
+      needed_cap=max(kmc%system%n_sites+1024,size(site_blocked)*2)
+      allocate(tmp_blocked(needed_cap))
+      tmp_blocked=.false.
+      call move_alloc(tmp_blocked,site_blocked)
+      allocate(tmp_idx(needed_cap))
+      call move_alloc(tmp_idx,blocked_sites)
     endif
-    call mpi_bcast(crystal_structure,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-    call mpi_bcast(max_nn,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-    call mpi_bcast(max_1nn,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-    call mpi_bcast(max_jump_shell,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-    call mpi_bcast(allow_exchange,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_error)
-    allocate(hop_event_states(max_nn,max_jump_shell))
+
+    crystal_structure=kmc%system%crystal_structure
+    max_nn=kmc%system%max_nn
+    max_1nn=kmc%system%max_1nn
+    max_jump_shell=kmc%system%max_jump_shell
+    allow_exchange=kmc%system%allow_exchange
+
+    if (.not. allocated(hop_event_states)) then
+      allocate(hop_event_states(max(1,max_nn),max(1,max_jump_shell)))
+    elseif (size(hop_event_states,1)<max_nn .or. size(hop_event_states,2)<max_jump_shell) then
+      deallocate(hop_event_states)
+      allocate(hop_event_states(max(1,max_nn),max(1,max_jump_shell)))
+    endif
     if (allow_exchange) then
-      allocate(exchange_event_states(max_1nn,max_1nn))
+      if (.not. allocated(exchange_event_states)) then
+        allocate(exchange_event_states(max(1,max_1nn),max(1,max_1nn)))
+      elseif (size(exchange_event_states,1)<max_1nn .or. size(exchange_event_states,2)<max_1nn) then
+        deallocate(exchange_event_states)
+        allocate(exchange_event_states(max(1,max_1nn),max(1,max_1nn)))
+      endif
     endif
-    if (myrank==0) then
-      n_deposited=kmc%system%n_deposited
-    endif
-    call mpi_bcast(n_deposited,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-    if (myrank==0) then
-      t2=mpi_wtime()
-      kmc%get_rates_overhead_time=kmc%get_rates_overhead_time+t2-t1
-    endif
+    n_deposited=kmc%system%n_deposited
+    t2=mpi_wtime()
+    kmc%get_rates_overhead_time=kmc%get_rates_overhead_time+t2-t1
 
     do i=1,n_deposited
-      if (myrank==0) then
-        t1=mpi_wtime()
-        site_id=kmc%system%deposited_atoms(i)
-        jumps_checked=kmc%system%sites(site_id)%jumps_checked
-        locked=kmc%system%sites(site_id)%locked
-        if (locked) then
-          kmc%system%sites(site_id)%hop_states(1:kmc%system%sites(site_id)%max_nn,1:max_jump_shell)=EVENT_FORBIDDEN
-          kmc%system%sites(site_id)%hop_rate=0.0_rk
-        endif
+      t1=mpi_wtime()
+      site_id=kmc%system%deposited_atoms(i)
+      jumps_checked=kmc%system%sites(site_id)%jumps_checked
+      locked=kmc%system%sites(site_id)%locked
+      if (locked) then
+        kmc%system%sites(site_id)%hop_states(1:kmc%system%sites(site_id)%max_nn,1:max_jump_shell)=EVENT_FORBIDDEN
+        kmc%system%sites(site_id)%hop_rate=0.0_rk
       endif
-      call mpi_bcast(jumps_checked,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_error)
       if (jumps_checked) then
-        if (myrank==0) then
-          t2=mpi_wtime()
-          kmc%get_rates_overhead_time=kmc%get_rates_overhead_time+t2-t1
-        endif
-        cycle
-      endif
-      if (myrank==0) then
-        hop_event_states=EVENT_FORBIDDEN
-        if (.not. locked) then
-          hop_event_states(1:kmc%system%sites(site_id)%max_nn,1:max_jump_shell)=&
-            kmc%system%sites(site_id)%hop_states(1:kmc%system%sites(site_id)%max_nn,1:max_jump_shell)
-        endif
-        if (allow_exchange) then
-          exchange_event_states=EVENT_FORBIDDEN
-          exchange_event_states(1:kmc%system%sites(site_id)%neighbour_shells(TRUE_1NN_SHELL(&
-                                crystal_structure))%n_neighbour_sites,&
-                                1:kmc%system%sites(site_id)%neighbour_shells(TRUE_1NN_SHELL(&
-                                crystal_structure))%n_neighbour_sites)=&
-            kmc%system%sites(site_id)%exchange_states(&
-              1:kmc%system%sites(site_id)%neighbour_shells(TRUE_1NN_SHELL(&
-              crystal_structure))%n_neighbour_sites,&
-              1:kmc%system%sites(site_id)%neighbour_shells(TRUE_1NN_SHELL(&
-              crystal_structure))%n_neighbour_sites)
-        endif
-        n_neighbour_sites=kmc%system%sites(site_id)%neighbour_shells(:)%n_neighbour_sites
-      endif
-      call mpi_bcast(hop_event_states,max_nn*max_jump_shell,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-      if (allow_exchange) then
-        call mpi_bcast(exchange_event_states,max_1nn*max_1nn,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-      endif
-      call mpi_bcast(n_neighbour_sites,NN_SHELLS,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-      call mpi_bcast(locked,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_error)
-  
-      if (myrank==0) then
-        nn_tmp=kmc%system%sites(1:kmc%system%n_sites)%nn
-        n_near_tmp=kmc%system%sites(1:kmc%system%n_sites)%n_near
-        do shell=1,TRUE_1NN_SHELL(crystal_structure)-1
-          do nn_atom=1,kmc%system%sites(site_id)%neighbour_shells(shell)%n_neighbour_sites
-            nn_id=kmc%system%sites(site_id)%neighbour_shells(shell)%neighbour_sites(nn_atom)
-            n_near_tmp(nn_id)=n_near_tmp(nn_id)-1
-          end do
-        end do
-        do nn_atom=1,kmc%system%sites(site_id)%neighbour_shells(TRUE_1NN_SHELL(&
-                                                                crystal_structure))%n_neighbour_sites
-          nn_id=kmc%system%sites(site_id)%neighbour_shells(TRUE_1NN_SHELL(&
-                  crystal_structure))%neighbour_sites(nn_atom)
-          nn_tmp(nn_id)=nn_tmp(nn_id)-1
-        end do
-      endif
-
-      if (myrank==0) then
-        site_blocked=.false.
         t2=mpi_wtime()
         kmc%get_rates_overhead_time=kmc%get_rates_overhead_time+t2-t1
+        cycle
       endif
+      hop_event_states=EVENT_FORBIDDEN
+      if (.not. locked) then
+        hop_event_states(1:kmc%system%sites(site_id)%max_nn,1:max_jump_shell)=&
+          kmc%system%sites(site_id)%hop_states(1:kmc%system%sites(site_id)%max_nn,1:max_jump_shell)
+      endif
+      if (allow_exchange) then
+        exchange_event_states=EVENT_FORBIDDEN
+        exchange_event_states(1:kmc%system%sites(site_id)%neighbour_shells(TRUE_1NN_SHELL(&
+                              crystal_structure))%n_neighbour_sites,&
+                              1:kmc%system%sites(site_id)%neighbour_shells(TRUE_1NN_SHELL(&
+                              crystal_structure))%n_neighbour_sites)=&
+          kmc%system%sites(site_id)%exchange_states(&
+            1:kmc%system%sites(site_id)%neighbour_shells(TRUE_1NN_SHELL(&
+            crystal_structure))%n_neighbour_sites,&
+            1:kmc%system%sites(site_id)%neighbour_shells(TRUE_1NN_SHELL(&
+            crystal_structure))%n_neighbour_sites)
+      endif
+      n_neighbour_sites=kmc%system%sites(site_id)%neighbour_shells(:)%n_neighbour_sites
+      t2=mpi_wtime()
+      kmc%get_rates_overhead_time=kmc%get_rates_overhead_time+t2-t1
 
       ! Hop events of site site_id
       if (.not. locked) then
@@ -673,217 +670,201 @@ contains
           shell=JUMP_SHELLS(jump_shell,crystal_structure)
           do nn_atom=1,n_neighbour_sites(shell)
             obstructed=.false.
-            if (myrank==0) then
-              t1=mpi_wtime()
-              final_id=kmc%system%sites(site_id)%neighbour_shells(shell)%neighbour_sites(nn_atom)
-              if (hop_event_states(nn_atom,jump_shell)==EVENT_VALID) then
+            t1=mpi_wtime()
+            final_id=kmc%system%sites(site_id)%neighbour_shells(shell)%neighbour_sites(nn_atom)
+            if (hop_event_states(nn_atom,jump_shell)==EVENT_VALID) then
+              if (.not. site_blocked(final_id)) then
                 site_blocked(final_id)=.true.
-              endif
-              if (site_blocked(final_id)) then
-                obstructed=.true.
-                do nn_nn_atom=1,kmc%system%sites(final_id)%neighbour_shells(JUMP_SHELLS(&
-                                1,crystal_structure))%n_neighbour_sites
-                  nn_nn_id=kmc%system%sites(final_id)%neighbour_shells(JUMP_SHELLS(&
-                             1,crystal_structure))%neighbour_sites(nn_nn_atom)
-                  if (kmc%system%sites(nn_nn_id)%Z==0) then
-                    site_blocked(nn_nn_id)=.true.
-                  endif
-                end do
+                n_blocked=n_blocked+1
+                blocked_sites(n_blocked)=final_id
               endif
             endif
-            call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-            if (internal_error/=0) then
-              if (present(error)) then
-                error=internal_error
-              endif
-              return
+            if (site_blocked(final_id)) then
+              obstructed=.true.
+              do nn_nn_atom=1,kmc%system%sites(final_id)%neighbour_shells(JUMP_SHELLS(&
+                              1,crystal_structure))%n_neighbour_sites
+                nn_nn_id=kmc%system%sites(final_id)%neighbour_shells(JUMP_SHELLS(&
+                           1,crystal_structure))%neighbour_sites(nn_nn_atom)
+                if (kmc%system%sites(nn_nn_id)%Z==0) then
+                  if (.not. site_blocked(nn_nn_id)) then
+                    site_blocked(nn_nn_id)=.true.
+                    n_blocked=n_blocked+1
+                    blocked_sites(n_blocked)=nn_nn_id
+                  endif
+                endif
+              end do
             endif
             if (hop_event_states(nn_atom,jump_shell)==EVENT_VALID) then
-              if (myrank==0) then
-                t2=mpi_wtime()
-                kmc%event_finding_time=kmc%event_finding_time+t2-t1
-              endif
+              t2=mpi_wtime()
+              kmc%event_finding_time=kmc%event_finding_time+t2-t1
               cycle
             endif
             if (hop_event_states(nn_atom,jump_shell)==EVENT_FORBIDDEN) then
-              if (myrank==0) then
-                t2=mpi_wtime()
-                kmc%event_finding_time=kmc%event_finding_time+t2-t1
-              endif
+              t2=mpi_wtime()
+              kmc%event_finding_time=kmc%event_finding_time+t2-t1
               cycle
             endif
-            if (myrank==0) then
-              if (kmc%verbosity>=VERBOSITY_LOUD) then
-                write(6,"(2(a,i0))") "# Getting rate for hop ",site_id,&
-                                     " -> ",final_id
-                t2=mpi_wtime()
-                kmc%event_finding_time=kmc%event_finding_time+t2-t1
-              endif
+            if (kmc%verbosity>=VERBOSITY_LOUD) then
+              write(6,"(2(a,i0))") "# Getting rate for hop ",site_id,&
+                                   " -> ",final_id
+              t2=mpi_wtime()
+              kmc%event_finding_time=kmc%event_finding_time+t2-t1
             endif
-            call mpi_bcast(obstructed,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_error)
             if (.not. obstructed) then
-              if (myrank==0) then
-                if (kmc%system%sites(final_id)%Z/=0) then
+              if (kmc%system%sites(final_id)%Z/=0) then
+                obstructed=.true.
+              endif
+              if (.not. obstructed) then
+                t1=mpi_wtime()
+                ! Adjust final_id's coordination directly without copying 80k-element nn_tmp/n_near_tmp arrays
+                n_near_final=kmc%system%sites(final_id)%n_near
+                if (shell<TRUE_1NN_SHELL(crystal_structure)) then
+                  n_near_final=n_near_final-1
+                endif
+                ! Adjust final_id's nn/n_near for vacated initial_id via local shell lookup (O(1) vs n_sites copy)
+          nn_final=kmc%system%sites(final_id)%nn
+                if (shell==TRUE_1NN_SHELL(crystal_structure)) then
+                  nn_final=nn_final-1
+                endif
+                nn_initial=kmc%system%sites(site_id)%nn
+                if (nn_final<N_NN_MIN(crystal_structure) .or. &
+                    n_near_final>0) then
                   obstructed=.true.
                 endif
+                ! Check minimization cache for a hit before doing a new minimization
                 if (.not. obstructed) then
                   t1=mpi_wtime()
-                  n_near_final=n_near_tmp(final_id)
-                  nn_final=nn_tmp(final_id)
-                  nn_initial=kmc%system%sites(site_id)%nn
-                  if (nn_final<N_NN_MIN(crystal_structure) .or. &
-                      n_near_final>0) then
-                    obstructed=.true.
+                  call create_fingerprint(kmc,site_id,final_id,fingerprint,error=internal_error)
+                  t2=mpi_wtime()
+                  kmc%rate_fingerprint_time=kmc%rate_fingerprint_time+t2-t1
+                  if (internal_error/=0) then
+                    write(0,"(a)") "*** Error getting fingerprint in get_rates()"
                   endif
-                  ! Check minimization cache for a hit before doing a new minimization
-                  if (.not. obstructed) then
+                  if (internal_error==0) then
                     t1=mpi_wtime()
-                    call create_fingerprint(kmc,site_id,final_id,fingerprint,error=internal_error)
+                    minim_result=check_minim_cache(kmc,fingerprint,error=internal_error)
                     t2=mpi_wtime()
-                    kmc%rate_fingerprint_time=kmc%rate_fingerprint_time+t2-t1
+                    kmc%rate_cache_time=kmc%rate_cache_time+t2-t1
                     if (internal_error/=0) then
-                      write(0,"(a)") "*** Error getting fingerprint in get_rates()"
+                      write(0,"(a)") "*** Error checking minimization cache in get_rates()"
                     endif
-                    if (internal_error==0) then
-                      t1=mpi_wtime()
-                      minim_result=check_minim_cache(kmc,fingerprint,error=internal_error)
-                      t2=mpi_wtime()
-                      kmc%rate_cache_time=kmc%rate_cache_time+t2-t1
-                      if (internal_error/=0) then
-                        write(0,"(a)") "*** Error checking minimization cache in get_rates()"
-                      endif
-                      if (minim_result==MINIM_RESULT_FAIL) then
-                        obstructed=.true.
-                        if (kmc%verbosity>=VERBOSITY_LOUD) then
-                          write(6,"(a)") "# Found a failed minimization in minim_cache"
-                        endif
+                    if (minim_result==MINIM_RESULT_FAIL) then
+                      obstructed=.true.
+                      if (kmc%verbosity>=VERBOSITY_LOUD) then
+                        write(6,"(a)") "# Found a failed minimization in minim_cache"
                       endif
                     endif
                   endif
                 endif
               endif
             endif
-            call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
             if (internal_error/=0) then
               if (present(error)) then
                 error=internal_error
               endif
               return
             endif
-            call mpi_bcast(obstructed,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_error)
             if (.not. obstructed) then
               if (hop_event_states(nn_atom,jump_shell)==EVENT_LAE_CHANGED) then
-                if (myrank==0) then
-                  only_substrate_jump=SUBSTRATE_NOT
-                  if (kmc%system%crystal_structure==CRYSTAL_STRUCTURE_CLOSE_PACKED) then
-                    if (kmc%system%orientation==ORIENTATION_111) then
-                      t1=mpi_wtime()
-                      call only_substrate_lae(kmc,site_id,final_id,only_substrate_jump,error=internal_error)
-                      t2=mpi_wtime()
-                      kmc%lae_sub_time=kmc%lae_sub_time+t2-t1
+                only_substrate_jump=SUBSTRATE_NOT
+                if (kmc%system%crystal_structure==CRYSTAL_STRUCTURE_CLOSE_PACKED) then
+                  if (kmc%system%orientation==ORIENTATION_111) then
+                    t1=mpi_wtime()
+                    call only_substrate_lae(kmc,site_id,final_id,only_substrate_jump,error=internal_error)
+                    t2=mpi_wtime()
+                    kmc%lae_sub_time=kmc%lae_sub_time+t2-t1
+                  endif
+                endif
+                if (internal_error/=0) then
+                  write(0,"(a)") "*** Error determining only-substrate lae case in get_rates()"
+                else
+                  if (only_substrate_jump==SUBSTRATE_NOT .or. kmc%substrate_fcc_hcp_barrier<0.0_rk &
+                                                         .or. kmc%substrate_hcp_fcc_barrier<0.0_rk) then
+                    t1=mpi_wtime()
+                    call get_jump_lae(kmc,site_id,final_id,jump_type=EVENT_TYPE_HOP,&
+                                      lae=lae,error=internal_error)
+                    t2=mpi_wtime()
+                    kmc%lae_time=kmc%lae_time+t2-t1
+                    if (internal_error/=0) then
+                      write(0,"(a)") "*** Error getting lae in get_rates()"
                     endif
                   endif
-                  if (internal_error/=0) then
-                    write(0,"(a)") "*** Error determining only-substrate lae case in get_rates()"
-                  else
-                    if (only_substrate_jump==SUBSTRATE_NOT .or. kmc%substrate_fcc_hcp_barrier<0.0_rk &
-                                                           .or. kmc%substrate_hcp_fcc_barrier<0.0_rk) then
+                  event_ok=.false.
+                  if (only_substrate_jump==SUBSTRATE_FCC_HCP) then
+                    if (kmc%substrate_fcc_hcp_barrier>=0.0_rk .and. kmc%substrate_hcp_fcc_barrier>=0.0_rk) then
+                      barrier=kmc%substrate_fcc_hcp_barrier
+                      reverse_barrier=kmc%substrate_hcp_fcc_barrier
+                      event_ok=.true.
+                    endif
+                  else if (only_substrate_jump==SUBSTRATE_HCP_FCC) then
+                    if (kmc%substrate_fcc_hcp_barrier>=0.0_rk .and. kmc%substrate_hcp_fcc_barrier>=0.0_rk) then
+                      barrier=kmc%substrate_hcp_fcc_barrier
+                      reverse_barrier=kmc%substrate_fcc_hcp_barrier
+                      event_ok=.true.
+                    endif
+                  endif
+                  nan_detected=.false.
+                  if (.not. event_ok) then
+                    t1=mpi_wtime()
+                    call calc(kmc%desc,lae,desc_forward,do_descriptor=.true.,&
+                              args_str="atom_mask_name=jumping",error=internal_error)
+                    t2=mpi_wtime()
+                    kmc%desc_time=kmc%desc_time+t2-t1
+                    if (internal_error/=0) then
+                      write(0,"(a)") "*** Error: couldn't calculate forward descriptor in get_rates()"
+                      call write(lae,"lae_"//lae_index//"_1.xyz")
+                    else
+                      if (any(desc_forward%x(1)%data(:)/=desc_forward%x(1)%data(:))) then
+                        write(0,"(a,i0)") "*** Warning: NaN values in forward descriptor of LAE ",lae_index
+                        nan_detected=.true.
+                        call write(lae,"lae_"//lae_index//"_1.xyz")
+                      endif
                       t1=mpi_wtime()
-                      call get_jump_lae(kmc,site_id,final_id,jump_type=EVENT_TYPE_HOP,&
-                                        lae=lae,error=internal_error)
+                      lae%pos(:,1)=kmc%system%sites(final_id)%cartesian_coords(:)
+                      call calc_connect(lae)
                       t2=mpi_wtime()
                       kmc%lae_time=kmc%lae_time+t2-t1
-                      if (internal_error/=0) then
-                        write(0,"(a)") "*** Error getting lae in get_rates()"
-                      endif
-                    endif
-                    event_ok=.false.
-                    if (only_substrate_jump==SUBSTRATE_FCC_HCP) then
-                      if (kmc%substrate_fcc_hcp_barrier>=0.0_rk .and. kmc%substrate_hcp_fcc_barrier>=0.0_rk) then
-                        barrier=kmc%substrate_fcc_hcp_barrier
-                        reverse_barrier=kmc%substrate_hcp_fcc_barrier
-                        event_ok=.true.
-                      endif
-                    else if (only_substrate_jump==SUBSTRATE_HCP_FCC) then
-                      if (kmc%substrate_fcc_hcp_barrier>=0.0_rk .and. kmc%substrate_hcp_fcc_barrier>=0.0_rk) then
-                        barrier=kmc%substrate_hcp_fcc_barrier
-                        reverse_barrier=kmc%substrate_fcc_hcp_barrier
-                        event_ok=.true.
-                      endif
-                    endif
-                    nan_detected=.false.
-                    if (.not. event_ok) then
+
                       t1=mpi_wtime()
-                      call calc(kmc%desc,lae,desc_forward,do_descriptor=.true.,&
+                      call calc(kmc%desc,lae,desc_reverse,do_descriptor=.true.,&
                                 args_str="atom_mask_name=jumping",error=internal_error)
                       t2=mpi_wtime()
                       kmc%desc_time=kmc%desc_time+t2-t1
                       if (internal_error/=0) then
-                        write(0,"(a)") "*** Error: couldn't calculate forward descriptor in get_rates()"
-                        call write(lae,"lae_"//lae_index//"_1.xyz")
+                        write(0,"(a)") "*** Error: couldn't calculate reverse descriptor in get_rates()"
+                        call write(lae,"lae_"//lae_index//"_2.xyz")
                       else
-                        if (any(desc_forward%x(1)%data(:)/=desc_forward%x(1)%data(:))) then
-                          write(0,"(a,i0)") "*** Warning: NaN values in forward descriptor of LAE ",lae_index
+                        if (any(desc_reverse%x(1)%data(:)/=desc_reverse%x(1)%data(:))) then
+                          write(0,"(a,i0)") "*** Warning: NaN values in reverse descriptor of LAE index ",lae_index
                           nan_detected=.true.
-                          call write(lae,"lae_"//lae_index//"_1.xyz")
-                        endif
-                        t1=mpi_wtime()
-                        lae%pos(:,1)=kmc%system%sites(final_id)%cartesian_coords(:)
-                        call calc_connect(lae)
-                        t2=mpi_wtime()
-                        kmc%lae_time=kmc%lae_time+t2-t1
-
-                        t1=mpi_wtime()
-                        call calc(kmc%desc,lae,desc_reverse,do_descriptor=.true.,&
-                                  args_str="atom_mask_name=jumping",error=internal_error)
-                        t2=mpi_wtime()
-                        kmc%desc_time=kmc%desc_time+t2-t1
-                        if (internal_error/=0) then
-                          write(0,"(a)") "*** Error: couldn't calculate reverse descriptor in get_rates()"
                           call write(lae,"lae_"//lae_index//"_2.xyz")
-                        else
-                          if (any(desc_reverse%x(1)%data(:)/=desc_reverse%x(1)%data(:))) then
-                            write(0,"(a,i0)") "*** Warning: NaN values in reverse descriptor of LAE index ",lae_index
-                            nan_detected=.true.
-                            call write(lae,"lae_"//lae_index//"_2.xyz")
-                          endif
                         endif
                       endif
-                      call finalise(lae)
-                      lae_index=lae_index+1
                     endif
+                    call finalise(lae)
+                    lae_index=lae_index+1
                   endif
                 endif
-                call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
                 if (internal_error/=0) then
                   if (present(error)) then
                     error=internal_error
                   endif
                   return
                 endif
-                call mpi_bcast(nan_detected,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_error)
-                call mpi_bcast(event_ok,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_error)
                 if (.not. nan_detected .and. .not. event_ok) then
-                  if (myrank==0) then
-                    t1=mpi_wtime()
-                    final_config=initial_config
-                    final_config%pos(:,kmc%system%sites(site_id)%id)=&
-                      kmc%system%sites(final_id)%cartesian_coords(:)
+                  t1=mpi_wtime()
+                  if (.not. initial_config%initialised) then
+                    initial_config=get_atoms(kmc%system)
                   endif
-                  call get_barrier(kmc,lmp,site_id,final_id,nn_tmp,fingerprint,minim_result,&
+                  call get_barrier(kmc,lmp,site_id,final_id,nn_final,fingerprint,minim_result,&
                                    desc_forward,desc_reverse,initial_config,&
-                                   final_config,barrier,reverse_barrier,event_ok,myrank,shell=shell,error=internal_error)
-                  if (myrank==0) then
-                    call finalise(desc_forward)
-                    call finalise(desc_reverse)
-                    call dealloc_atoms(final_config)
-                    t2=mpi_wtime()
-                    kmc%get_barrier_time=kmc%get_barrier_time+t2-t1
-                  endif
+                                   barrier,reverse_barrier,event_ok,myrank,shell=shell,error=internal_error)
+                  call finalise(desc_forward)
+                  call finalise(desc_reverse)
+                  t2=mpi_wtime()
+                  kmc%get_barrier_time=kmc%get_barrier_time+t2-t1
                   if (internal_error/=0) then
-                    if (myrank==0) then
-                      write(0,"(a)") "*** Error: couldn't get barrier in get_rates()"
-                    endif
+                    write(0,"(a)") "*** Error: couldn't get barrier in get_rates()"
                     if (present(error)) then
                       error=internal_error
                     endif
@@ -895,344 +876,9 @@ contains
                 event_ok=.true.
               endif
             endif
-            if (myrank==0) then
-              t1=mpi_wtime()
-              if (obstructed .or. nan_detected .or. .not. event_ok) then
-                kmc%system%sites(site_id)%hop_states(nn_atom,jump_shell)=EVENT_FORBIDDEN
-                if (kmc%verbosity>=VERBOSITY_LOUD) then
-                  write(6,"(a)") "# Event marked forbidden"
-                  if (kmc%debug .and. kmc%verbosity>=VERBOSITY_ABSURD) then
-                    if (obstructed) then
-                      write(6,"(a)") "# Reason: obstructed site"
-                    elseif (nan_detected) then
-                      write(6,"(a)") "# Reason: NaN detected"
-                    elseif (.not. event_ok) then
-                      write(6,"(a)") "# Reason: get_barrier() returned event_ok=FALSE"
-                    endif
-                  endif
-                endif
-              else
-                do nn_nn_atom=1,kmc%system%sites(final_id)%neighbour_shells(JUMP_SHELLS(&
-                                1,crystal_structure))%n_neighbour_sites
-                  nn_id=kmc%system%sites(final_id)%neighbour_shells(JUMP_SHELLS(&
-                          1,crystal_structure))%neighbour_sites(nn_nn_atom)
-                  if (kmc%system%sites(nn_id)%Z==0) then
-                    site_blocked(nn_id)=.true.
-                  endif
-                end do
-                if (kmc%system%sites(site_id)%hop_states(nn_atom,jump_shell)==EVENT_LAE_CHANGED) then
-                  barrier=max(0.0_rk,barrier)
-                  if (barrier>0) then
-                    reverse_barrier=max(0.0_rk,reverse_barrier)
-                  else
-                    reverse_barrier=100.0_rk
-                  endif
-                  kmc%system%sites(site_id)%hop_barriers(1,nn_atom,jump_shell)=barrier
-                  kmc%system%sites(site_id)%hop_barriers(2,nn_atom,jump_shell)=reverse_barrier
-                  kmc%system%sites(site_id)%hop_rates(nn_atom,jump_shell)=&
-                    kmc%attempt_frequency*exp(-real(barrier,kind=dp)/kmc%kT)
-                endif
-                kmc%system%sites(site_id)%hop_states(nn_atom,jump_shell)=EVENT_VALID
-  
-                if (kmc%verbosity>=VERBOSITY_LOUD) then
-                  write(6,"(a,f10.6,a)") "# E_{m} = ",&
-                    kmc%system%sites(site_id)%hop_barriers(1,nn_atom,jump_shell)," eV"
-                  write(6,"(a,f10.6,a)") "# E_{m,reverse} = ",&
-                    kmc%system%sites(site_id)%hop_barriers(2,nn_atom,jump_shell)," eV"
-                  write(6,"(a,g10.3,a)") "# rate = ",kmc%system%sites(site_id)%hop_rates(nn_atom,jump_shell)," Hz"
-                endif
-                if (only_substrate_jump==SUBSTRATE_FCC_HCP) then
-                  if (kmc%substrate_fcc_hcp_barrier<0.0_rk .and. kmc%substrate_hcp_fcc_barrier<0.0_rk) then
-                    kmc%substrate_fcc_hcp_barrier=barrier
-                    kmc%substrate_hcp_fcc_barrier=reverse_barrier
-                  endif
-                elseif (only_substrate_jump==SUBSTRATE_HCP_FCC) then
-                  if (kmc%substrate_fcc_hcp_barrier<0.0_rk .and. kmc%substrate_hcp_fcc_barrier<0.0_rk) then
-                    kmc%substrate_hcp_fcc_barrier=barrier
-                    kmc%substrate_fcc_hcp_barrier=reverse_barrier
-                  endif
-                endif
-              endif
-              t2=mpi_wtime()
-              kmc%assigning_time=kmc%assigning_time+t2-t1
-            endif
-            call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-            if (internal_error/=0) then
-              if (present(error)) then
-                error=internal_error
-              endif
-              return
-            endif
-          end do
-        end do
-      endif
-      if (myrank==0) then
-        if (any(kmc%system%sites(site_id)%hop_states(:,:)==EVENT_LAE_CHANGED)) then
-          write(0,"(a,i0,a)") "*** Error: site ",site_id," has unchecked hop events in get_rates()"
-          internal_error=1
-        endif
-        if (internal_error==0) then
-          kmc%system%sites(site_id)%hop_rate=sum(&
-            kmc%system%sites(site_id)%hop_rates(:,:),&
-            mask=kmc%system%sites(site_id)%hop_states(:,:)==EVENT_VALID)
-        endif
-      endif
-      call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-      if (internal_error/=0) then
-        if (present(error)) then
-          error=internal_error
-        endif
-        return
-      endif
-
-      call mpi_bcast(allow_exchange,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_error)
-      if (.not. allow_exchange) then
-        cycle
-      endif
-
-      ! Exchange events
-      do initial_site=1,n_neighbour_sites(TRUE_1NN_SHELL(crystal_structure))
-        obstructed=.false.
-        if (myrank==0) then
-          t1=mpi_wtime()
-          initial_id=kmc%system%sites(site_id)%neighbour_shells(&
-                       TRUE_1NN_SHELL(crystal_structure))%neighbour_sites(initial_site)
-          if (kmc%system%sites(initial_id)%substrate) then
-            obstructed=.true.
-          elseif (kmc%system%sites(initial_id)%Z<=0) then
-            obstructed=.true.
-          elseif (kmc%system%sites(initial_id)%locked) then
-            obstructed=.true.
-          endif
-          if (.not. obstructed) then
-            nn_tmp=kmc%system%sites(1:kmc%system%n_sites)%nn
-            n_near_tmp=kmc%system%sites(1:kmc%system%n_sites)%n_near
-            do shell=1,TRUE_1NN_SHELL(crystal_structure)-1
-              do nn_atom=1,kmc%system%sites(initial_id)%neighbour_shells(shell)%n_neighbour_sites
-              n_near_tmp(kmc%system%sites(initial_id)%neighbour_shells(shell)%neighbour_sites(nn_atom)) &
-                         =n_near_tmp(kmc%system%sites(initial_id)%neighbour_shells(shell)%neighbour_sites(nn_atom))-1
-              end do
-            end do
-            do nn_atom=1,kmc%system%sites(initial_id)%neighbour_shells(TRUE_1NN_SHELL(&
-                         crystal_structure))%n_neighbour_sites
-              nn_tmp(kmc%system%sites(initial_id)%neighbour_shells(TRUE_1NN_SHELL(&
-                     crystal_structure))%neighbour_sites(nn_atom)) &
-                     =nn_tmp(kmc%system%sites(initial_id)%neighbour_shells(TRUE_1NN_SHELL(&
-                        crystal_structure))%neighbour_sites(nn_atom))-1
-            end do
-          endif
-        endif
-        call mpi_bcast(obstructed,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_error)
-        if (obstructed) then
-          if (myrank==0) then
-            if (kmc%debug .and. kmc%verbosity>=VERBOSITY_ABSURD) then
-              write(6,"(a,i0,a)") "# All exchange events from initial_site ",&
-                                   initial_id," marked forbidden. Reason:"
-              if (kmc%system%sites(initial_id)%substrate) then
-                write(6,"(a)") "# initial_site is substrate"
-              elseif (kmc%system%sites(initial_id)%Z<=0) then
-                write(6,"(a)") "# initial_site is not an atom"
-              elseif (kmc%system%sites(initial_id)%locked) then
-                write(6,"(a)") "# initial_site is locked"
-              else
-                write(6,"(a)") "# other. Bug?"
-              endif
-            endif
-            kmc%system%sites(site_id)%exchange_states(:,initial_site)=EVENT_FORBIDDEN
-          endif
-          exchange_event_states(:,initial_site)=EVENT_FORBIDDEN
-          if (myrank==0) then
-            t2=mpi_wtime()
-            kmc%event_finding_time=kmc%event_finding_time+t2-t1
-          endif
-          cycle
-        endif
-        do final_site=1,n_neighbour_sites(TRUE_1NN_SHELL(crystal_structure))
-          if (myrank==0) then
-            t1=mpi_wtime()
-          endif
-          if (exchange_event_states(final_site,initial_site)==EVENT_VALID) then
-            if (myrank==0) then
-              t2=mpi_wtime()
-              kmc%event_finding_time=kmc%event_finding_time+t2-t1
-            endif
-            cycle
-          endif
-          if (exchange_event_states(final_site,initial_site)==EVENT_FORBIDDEN) then
-            if (myrank==0) then
-              t2=mpi_wtime()
-              kmc%event_finding_time=kmc%event_finding_time+t2-t1
-            endif
-            cycle
-          endif
-          t2=mpi_wtime()
-          kmc%event_finding_time=kmc%event_finding_time+t2-t1
-          obstructed=.false.
-          if (myrank==0) then
-            t1=mpi_wtime()
-            final_id=kmc%system%sites(site_id)%neighbour_shells(TRUE_1NN_SHELL(&
-                       crystal_structure))%neighbour_sites(final_site)
-            if (kmc%verbosity>=VERBOSITY_LOUD) then
-              write(6,"(3(a,i0))") "# Getting rate for exchange ",&
-                                   initial_id," -> ",site_id," -> ",final_id
-            endif
-            nn_final=nn_tmp(final_id)
-            nn_initial=kmc%system%sites(initial_id)%nn
-            nn_mid=kmc%system%sites(site_id)%nn
-            if (kmc%system%sites(final_id)%Z/=0) then
-              if (kmc%debug .and. kmc%verbosity>=VERBOSITY_ABSURD) then
-                write(6,"(a)") "# Not a valid adsorption site"
-              endif
-              obstructed=.true.
-            elseif (nn_final<N_NN_MIN(crystal_structure)) then
-              if (kmc%debug .and. kmc%verbosity>=VERBOSITY_ABSURD) then
-                write(6,"(a,i0)") "# Not a stable adsorption site - nn<",N_NN_MIN(crystal_structure)
-              endif
-              obstructed=.true.
-            elseif (n_near_tmp(final_id)>0) then
-              if (kmc%debug .and. kmc%verbosity>=VERBOSITY_ABSURD) then
-                write(6,"(a)") "# Not a stable adsorption site - n_near>0"
-              endif
-              obstructed=.true.
-            endif
-            ! Check minimization cache for a hit before doing a new minimization
-            if (.not. obstructed) then
-              t1=mpi_wtime()
-              call create_fingerprint(kmc,site_id,final_id,fingerprint,initial_id=initial_id,error=internal_error)
-              t2=mpi_wtime()
-              kmc%rate_fingerprint_time=kmc%rate_fingerprint_time+t2-t1
-              if (internal_error/=0) then
-                write(0,"(a)") "*** Error getting fingerprint in get_rates()"
-              endif
-              if (internal_error==0) then
-                t1=mpi_wtime()
-                minim_result=check_minim_cache(kmc,fingerprint,error=internal_error)
-                t2=mpi_wtime()
-                kmc%rate_cache_time=kmc%rate_cache_time+t2-t1
-                if (internal_error/=0) then
-                  write(0,"(a)") "*** Error checking minimization cache in get_rates()"
-                endif
-                if (minim_result==MINIM_RESULT_FAIL) then
-                  obstructed=.true.
-                  if (kmc%verbosity>=VERBOSITY_LOUD) then
-                    write(6,"(a)") "# Found a failed minimization in minim_cache"
-                  endif
-                endif
-              endif
-            endif
-          endif
-          call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-          if (internal_error/=0) then
-            if (present(error)) then
-              error=internal_error
-            endif
-            return
-          endif
-          call mpi_bcast(obstructed,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_error)
-          if (.not. obstructed) then
-            if (exchange_event_states(final_site,initial_site)==EVENT_LAE_CHANGED) then
-              if (myrank==0) then
-                t1=mpi_wtime()
-                call get_jump_lae(kmc,site_id,final_id,jump_type=EVENT_TYPE_EXCHANGE,&
-                                  lae=lae,jumping_ptr=jumping_ptr,&
-                                  initial_id=initial_id,&
-                                  error=internal_error)
-                t2=mpi_wtime()
-                kmc%lae_time=kmc%lae_time+t2-t1
-                if (internal_error/=0) then
-                  write(0,"(a)") "*** Error getting lae in get_rates()"
-                  if (present(error)) then
-                    error=internal_error
-                  endif
-                endif
-                nan_detected=.false.
-                t1=mpi_wtime()
-                call calc(kmc%desc,lae,desc_forward,do_descriptor=.true.,&
-                          args_str="atom_mask_name=jumping",error=internal_error)
-                t2=mpi_wtime()
-                kmc%desc_time=kmc%desc_time+t2-t1
-                if (internal_error/=0) then
-                  write(0,"(a)") "*** Error: couldn't calculate forward descriptor in get_rates()"
-                  if (present(error)) then
-                    error=internal_error
-                  endif
-                else
-                  if (any(desc_forward%x(1)%data(:)/=desc_forward%x(1)%data(:))) then
-                    write(0,"(a,i0)") "*** Warning: NaN values in forward descriptor of LAE index ",lae_index
-                    call write(lae,"lae_"//lae_index//"_1.xyz")
-                    nan_detected=.true.
-                  endif
-                  t1=mpi_wtime()
-                  lae%pos(:,1)=kmc%system%sites(site_id)%cartesian_coords(:)
-                  lae%pos(:,2)=kmc%system%sites(final_id)%cartesian_coords(:)
-                  jumping_ptr(1)=.false.
-                  jumping_ptr(2)=.true.
-                  call calc_connect(lae)
-                  t2=mpi_wtime()
-                  kmc%lae_time=kmc%lae_time+t2-t1
-
-                  t1=mpi_wtime()
-                  call calc(kmc%desc,lae,desc_reverse,do_descriptor=.true.,args_str="atom_mask_name=jumping",error=internal_error)
-                  t2=mpi_wtime()
-                  kmc%desc_time=kmc%desc_time+t2-t1
-                  if (internal_error/=0) then
-                    write(0,"(a)") "*** Error: couldn't calculate reverse descriptor in get_rates()"
-                    if (present(error)) then
-                      error=internal_error
-                    endif
-                  else
-                    if (any(desc_reverse%x(1)%data(:)/=desc_reverse%x(1)%data(:))) then
-                      write(0,"(a,i0)") "*** Warning: NaN values in reverse descriptor of LAE index ",lae_index
-                      call write(lae,"lae_"//lae_index//"_2.xyz")
-                      nan_detected=.true.
-                    endif
-                  endif
-                endif
-                call finalise(lae)
-                nullify(jumping_ptr)
-                lae_index=lae_index+1
-              endif
-              call mpi_bcast(nan_detected,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_error)
-              if (.not. nan_detected) then
-                if (myrank==0) then
-                  t1=mpi_wtime()
-                  final_config=initial_config
-                  final_config%pos(:,kmc%system%sites(site_id)%id)=&
-                    kmc%system%sites(final_id)%cartesian_coords(:)
-                  final_config%pos(:,kmc%system%sites(initial_id)%id)=&
-                    kmc%system%sites(site_id)%cartesian_coords(:)
-                endif
-                call get_barrier(kmc,lmp,site_id,final_id,nn_tmp,fingerprint,minim_result,&
-                                 desc_forward,desc_reverse,initial_config,&
-                                 final_config,barrier,reverse_barrier,event_ok,myrank,&
-                                 initial_id=initial_id,&
-                                 error=internal_error)
-                if (myrank==0) then
-                  call finalise(desc_forward)
-                  call finalise(desc_reverse)
-                  call dealloc_atoms(final_config)
-                  t2=mpi_wtime()
-                  kmc%get_barrier_time=kmc%get_barrier_time+t2-t1
-                endif
-                if (internal_error/=0) then
-                  if (myrank==0) then
-                    write(0,"(a)") "*** Error: couldn't get barrier in get_rates()"
-                  endif
-                  if (present(error)) then
-                    error=internal_error
-                  endif
-                  return
-                endif
-              endif
-            else
-              event_ok=.true.
-              nan_detected=.false.
-            endif
-          endif
-          if (myrank==0) then
             t1=mpi_wtime()
             if (obstructed .or. nan_detected .or. .not. event_ok) then
-              kmc%system%sites(site_id)%exchange_states(final_site,initial_site)=EVENT_FORBIDDEN
+              kmc%system%sites(site_id)%hop_states(nn_atom,jump_shell)=EVENT_FORBIDDEN
               if (kmc%verbosity>=VERBOSITY_LOUD) then
                 write(6,"(a)") "# Event marked forbidden"
                 if (kmc%debug .and. kmc%verbosity>=VERBOSITY_ABSURD) then
@@ -1246,47 +892,343 @@ contains
                 endif
               endif
             else
-              if (kmc%system%sites(site_id)%exchange_states(final_site,initial_site)==EVENT_LAE_CHANGED) then
+              do nn_nn_atom=1,kmc%system%sites(final_id)%neighbour_shells(JUMP_SHELLS(&
+                              1,crystal_structure))%n_neighbour_sites
+                nn_id=kmc%system%sites(final_id)%neighbour_shells(JUMP_SHELLS(&
+                        1,crystal_structure))%neighbour_sites(nn_nn_atom)
+                if (kmc%system%sites(nn_id)%Z==0) then
+                  if (.not. site_blocked(nn_id)) then
+                    site_blocked(nn_id)=.true.
+                    n_blocked=n_blocked+1
+                    blocked_sites(n_blocked)=nn_id
+                  endif
+                endif
+              end do
+              if (kmc%system%sites(site_id)%hop_states(nn_atom,jump_shell)==EVENT_LAE_CHANGED) then
                 barrier=max(0.0_rk,barrier)
                 if (barrier>0) then
                   reverse_barrier=max(0.0_rk,reverse_barrier)
                 else
                   reverse_barrier=100.0_rk
                 endif
-                kmc%system%sites(site_id)%exchange_barriers(1,final_site,initial_site)=barrier
-                kmc%system%sites(site_id)%exchange_barriers(2,final_site,initial_site)=reverse_barrier
-                kmc%system%sites(site_id)%exchange_rates(final_site,initial_site)=&
+                kmc%system%sites(site_id)%hop_barriers(1,nn_atom,jump_shell)=barrier
+                kmc%system%sites(site_id)%hop_barriers(2,nn_atom,jump_shell)=reverse_barrier
+                kmc%system%sites(site_id)%hop_rates(nn_atom,jump_shell)=&
                   kmc%attempt_frequency*exp(-real(barrier,kind=dp)/kmc%kT)
               endif
-              kmc%system%sites(site_id)%exchange_states(final_site,initial_site)=EVENT_VALID
+              kmc%system%sites(site_id)%hop_states(nn_atom,jump_shell)=EVENT_VALID
 
               if (kmc%verbosity>=VERBOSITY_LOUD) then
                 write(6,"(a,f10.6,a)") "# E_{m} = ",&
-                  kmc%system%sites(site_id)%exchange_barriers(1,final_site,initial_site)," eV"
+                  kmc%system%sites(site_id)%hop_barriers(1,nn_atom,jump_shell)," eV"
                 write(6,"(a,f10.6,a)") "# E_{m,reverse} = ",&
-                  kmc%system%sites(site_id)%exchange_barriers(2,final_site,initial_site)," eV"
-                write(6,"(a,g10.3,a)") "# rate = ",kmc%system%sites(site_id)%exchange_rates(final_site,initial_site)," Hz"
+                  kmc%system%sites(site_id)%hop_barriers(2,nn_atom,jump_shell)," eV"
+                write(6,"(a,g10.3,a)") "# rate = ",kmc%system%sites(site_id)%hop_rates(nn_atom,jump_shell)," Hz"
+              endif
+              if (only_substrate_jump==SUBSTRATE_FCC_HCP) then
+                if (kmc%substrate_fcc_hcp_barrier<0.0_rk .and. kmc%substrate_hcp_fcc_barrier<0.0_rk) then
+                  kmc%substrate_fcc_hcp_barrier=barrier
+                  kmc%substrate_hcp_fcc_barrier=reverse_barrier
+                endif
+              elseif (only_substrate_jump==SUBSTRATE_HCP_FCC) then
+                if (kmc%substrate_fcc_hcp_barrier<0.0_rk .and. kmc%substrate_hcp_fcc_barrier<0.0_rk) then
+                  kmc%substrate_hcp_fcc_barrier=barrier
+                  kmc%substrate_fcc_hcp_barrier=reverse_barrier
+                endif
               endif
             endif
             t2=mpi_wtime()
             kmc%assigning_time=kmc%assigning_time+t2-t1
+          end do
+        end do
+        ! Clear only the sites touched by this atom instead of scanning 1:n_sites
+        if (n_blocked>0) then
+          do k_chk=1,n_blocked
+            site_blocked(blocked_sites(k_chk))=.false.
+          end do
+          n_blocked=0
+        endif
+      endif
+      if (any(kmc%system%sites(site_id)%hop_states(:,:)==EVENT_LAE_CHANGED)) then
+        write(0,"(a,i0,a)") "*** Error: site ",site_id," has unchecked hop events in get_rates()"
+        internal_error=1
+      endif
+      if (internal_error==0) then
+        kmc%system%sites(site_id)%hop_rate=sum(&
+          kmc%system%sites(site_id)%hop_rates(:,:),&
+          mask=kmc%system%sites(site_id)%hop_states(:,:)==EVENT_VALID)
+      endif
+      if (internal_error/=0) then
+        if (present(error)) then
+          error=internal_error
+        endif
+        return
+      endif
+
+      if (.not. allow_exchange) then
+        cycle
+      endif
+
+      ! Exchange events
+      do initial_site=1,n_neighbour_sites(TRUE_1NN_SHELL(crystal_structure))
+        obstructed=.false.
+        t1=mpi_wtime()
+        initial_id=kmc%system%sites(site_id)%neighbour_shells(&
+                     TRUE_1NN_SHELL(crystal_structure))%neighbour_sites(initial_site)
+        if (kmc%system%sites(initial_id)%substrate) then
+          obstructed=.true.
+        elseif (kmc%system%sites(initial_id)%Z<=0) then
+          obstructed=.true.
+        elseif (kmc%system%sites(initial_id)%locked) then
+          obstructed=.true.
+        endif
+        if (obstructed) then
+          if (kmc%debug .and. kmc%verbosity>=VERBOSITY_ABSURD) then
+            write(6,"(a,i0,a)") "# All exchange events from initial_site ",&
+                                 initial_id," marked forbidden. Reason:"
+            if (kmc%system%sites(initial_id)%substrate) then
+              write(6,"(a)") "# initial_site is substrate"
+            elseif (kmc%system%sites(initial_id)%Z<=0) then
+              write(6,"(a)") "# initial_site is not an atom"
+            elseif (kmc%system%sites(initial_id)%locked) then
+              write(6,"(a)") "# initial_site is locked"
+            else
+              write(6,"(a)") "# other. Bug?"
+            endif
           endif
+          kmc%system%sites(site_id)%exchange_states(:,initial_site)=EVENT_FORBIDDEN
+          exchange_event_states(:,initial_site)=EVENT_FORBIDDEN
+          t2=mpi_wtime()
+          kmc%event_finding_time=kmc%event_finding_time+t2-t1
+          cycle
+        endif
+        do final_site=1,n_neighbour_sites(TRUE_1NN_SHELL(crystal_structure))
+          t1=mpi_wtime()
+          if (exchange_event_states(final_site,initial_site)==EVENT_VALID) then
+            t2=mpi_wtime()
+            kmc%event_finding_time=kmc%event_finding_time+t2-t1
+            cycle
+          endif
+          if (exchange_event_states(final_site,initial_site)==EVENT_FORBIDDEN) then
+            t2=mpi_wtime()
+            kmc%event_finding_time=kmc%event_finding_time+t2-t1
+            cycle
+          endif
+          t2=mpi_wtime()
+          kmc%event_finding_time=kmc%event_finding_time+t2-t1
+          obstructed=.false.
+          t1=mpi_wtime()
+          final_id=kmc%system%sites(site_id)%neighbour_shells(TRUE_1NN_SHELL(&
+                     crystal_structure))%neighbour_sites(final_site)
+          if (kmc%verbosity>=VERBOSITY_LOUD) then
+            write(6,"(3(a,i0))") "# Getting rate for exchange ",&
+                                 initial_id," -> ",site_id," -> ",final_id
+          endif
+          ! Adjust final_id's nn/n_near for vacated initial_id via local shell lookup (O(1) vs n_sites copy)
+          nn_final=kmc%system%sites(final_id)%nn
+          do nn_atom=1,kmc%system%sites(initial_id)%neighbour_shells(TRUE_1NN_SHELL(crystal_structure))%n_neighbour_sites
+            if (kmc%system%sites(initial_id)%neighbour_shells(TRUE_1NN_SHELL(crystal_structure))%neighbour_sites(nn_atom)==final_id) then
+              nn_final=nn_final-1
+            endif
+          end do
+          n_near_final=kmc%system%sites(final_id)%n_near
+          do s_chk=1,TRUE_1NN_SHELL(crystal_structure)-1
+            do nn_atom=1,kmc%system%sites(initial_id)%neighbour_shells(s_chk)%n_neighbour_sites
+              if (kmc%system%sites(initial_id)%neighbour_shells(s_chk)%neighbour_sites(nn_atom)==final_id) then
+                n_near_final=n_near_final-1
+              endif
+            end do
+          end do
+          nn_initial=kmc%system%sites(initial_id)%nn
+          nn_mid=kmc%system%sites(site_id)%nn
+          if (kmc%system%sites(final_id)%Z/=0) then
+            if (kmc%debug .and. kmc%verbosity>=VERBOSITY_ABSURD) then
+              write(6,"(a)") "# Not a valid adsorption site"
+            endif
+            obstructed=.true.
+          elseif (nn_final<N_NN_MIN(crystal_structure)) then
+            if (kmc%debug .and. kmc%verbosity>=VERBOSITY_ABSURD) then
+              write(6,"(a,i0)") "# Not a stable adsorption site - nn<",N_NN_MIN(crystal_structure)
+            endif
+            obstructed=.true.
+          elseif (n_near_final>0) then
+            if (kmc%debug .and. kmc%verbosity>=VERBOSITY_ABSURD) then
+              write(6,"(a)") "# Not a stable adsorption site - n_near>0"
+            endif
+            obstructed=.true.
+          endif
+          ! Check minimization cache for a hit before doing a new minimization
+          if (.not. obstructed) then
+            t1=mpi_wtime()
+            call create_fingerprint(kmc,site_id,final_id,fingerprint,initial_id=initial_id,error=internal_error)
+            t2=mpi_wtime()
+            kmc%rate_fingerprint_time=kmc%rate_fingerprint_time+t2-t1
+            if (internal_error/=0) then
+              write(0,"(a)") "*** Error getting fingerprint in get_rates()"
+            endif
+            if (internal_error==0) then
+              t1=mpi_wtime()
+              minim_result=check_minim_cache(kmc,fingerprint,error=internal_error)
+              t2=mpi_wtime()
+              kmc%rate_cache_time=kmc%rate_cache_time+t2-t1
+              if (internal_error/=0) then
+                write(0,"(a)") "*** Error checking minimization cache in get_rates()"
+              endif
+              if (minim_result==MINIM_RESULT_FAIL) then
+                obstructed=.true.
+                if (kmc%verbosity>=VERBOSITY_LOUD) then
+                  write(6,"(a)") "# Found a failed minimization in minim_cache"
+                endif
+              endif
+            endif
+          endif
+          if (internal_error/=0) then
+            if (present(error)) then
+              error=internal_error
+            endif
+            return
+          endif
+          if (.not. obstructed) then
+            if (exchange_event_states(final_site,initial_site)==EVENT_LAE_CHANGED) then
+              t1=mpi_wtime()
+              call get_jump_lae(kmc,site_id,final_id,jump_type=EVENT_TYPE_EXCHANGE,&
+                                lae=lae,jumping_ptr=jumping_ptr,&
+                                initial_id=initial_id,&
+                                error=internal_error)
+              t2=mpi_wtime()
+              kmc%lae_time=kmc%lae_time+t2-t1
+              if (internal_error/=0) then
+                write(0,"(a)") "*** Error getting lae in get_rates()"
+                if (present(error)) then
+                  error=internal_error
+                endif
+              endif
+              nan_detected=.false.
+              t1=mpi_wtime()
+              call calc(kmc%desc,lae,desc_forward,do_descriptor=.true.,&
+                        args_str="atom_mask_name=jumping",error=internal_error)
+              t2=mpi_wtime()
+              kmc%desc_time=kmc%desc_time+t2-t1
+              if (internal_error/=0) then
+                write(0,"(a)") "*** Error: couldn't calculate forward descriptor in get_rates()"
+                if (present(error)) then
+                  error=internal_error
+                endif
+              else
+                if (any(desc_forward%x(1)%data(:)/=desc_forward%x(1)%data(:))) then
+                  write(0,"(a,i0)") "*** Warning: NaN values in forward descriptor of LAE index ",lae_index
+                  call write(lae,"lae_"//lae_index//"_1.xyz")
+                  nan_detected=.true.
+                endif
+                t1=mpi_wtime()
+                lae%pos(:,1)=kmc%system%sites(site_id)%cartesian_coords(:)
+                lae%pos(:,2)=kmc%system%sites(final_id)%cartesian_coords(:)
+                jumping_ptr(1)=.false.
+                jumping_ptr(2)=.true.
+                call calc_connect(lae)
+                t2=mpi_wtime()
+                kmc%lae_time=kmc%lae_time+t2-t1
+
+                t1=mpi_wtime()
+                call calc(kmc%desc,lae,desc_reverse,do_descriptor=.true.,args_str="atom_mask_name=jumping",error=internal_error)
+                t2=mpi_wtime()
+                kmc%desc_time=kmc%desc_time+t2-t1
+                if (internal_error/=0) then
+                  write(0,"(a)") "*** Error: couldn't calculate reverse descriptor in get_rates()"
+                  if (present(error)) then
+                    error=internal_error
+                  endif
+                else
+                  if (any(desc_reverse%x(1)%data(:)/=desc_reverse%x(1)%data(:))) then
+                    write(0,"(a,i0)") "*** Warning: NaN values in reverse descriptor of LAE index ",lae_index
+                    call write(lae,"lae_"//lae_index//"_2.xyz")
+                    nan_detected=.true.
+                  endif
+                endif
+              endif
+              call finalise(lae)
+              nullify(jumping_ptr)
+              lae_index=lae_index+1
+              if (.not. nan_detected) then
+                t1=mpi_wtime()
+                if (.not. initial_config%initialised) then
+                  initial_config=get_atoms(kmc%system)
+                endif
+                call get_barrier(kmc,lmp,site_id,final_id,nn_final,fingerprint,minim_result,&
+                                 desc_forward,desc_reverse,initial_config,&
+                                 barrier,reverse_barrier,event_ok,myrank,&
+                                 initial_id=initial_id,&
+                                 error=internal_error)
+                call finalise(desc_forward)
+                call finalise(desc_reverse)
+                t2=mpi_wtime()
+                kmc%get_barrier_time=kmc%get_barrier_time+t2-t1
+                if (internal_error/=0) then
+                  write(0,"(a)") "*** Error: couldn't get barrier in get_rates()"
+                  if (present(error)) then
+                    error=internal_error
+                  endif
+                  return
+                endif
+              endif
+            else
+              event_ok=.true.
+              nan_detected=.false.
+            endif
+          endif
+          t1=mpi_wtime()
+          if (obstructed .or. nan_detected .or. .not. event_ok) then
+            kmc%system%sites(site_id)%exchange_states(final_site,initial_site)=EVENT_FORBIDDEN
+            if (kmc%verbosity>=VERBOSITY_LOUD) then
+              write(6,"(a)") "# Event marked forbidden"
+              if (kmc%debug .and. kmc%verbosity>=VERBOSITY_ABSURD) then
+                if (obstructed) then
+                  write(6,"(a)") "# Reason: obstructed site"
+                elseif (nan_detected) then
+                  write(6,"(a)") "# Reason: NaN detected"
+                elseif (.not. event_ok) then
+                  write(6,"(a)") "# Reason: get_barrier() returned event_ok=FALSE"
+                endif
+              endif
+            endif
+          else
+            if (kmc%system%sites(site_id)%exchange_states(final_site,initial_site)==EVENT_LAE_CHANGED) then
+              barrier=max(0.0_rk,barrier)
+              if (barrier>0) then
+                reverse_barrier=max(0.0_rk,reverse_barrier)
+              else
+                reverse_barrier=100.0_rk
+              endif
+              kmc%system%sites(site_id)%exchange_barriers(1,final_site,initial_site)=barrier
+              kmc%system%sites(site_id)%exchange_barriers(2,final_site,initial_site)=reverse_barrier
+              kmc%system%sites(site_id)%exchange_rates(final_site,initial_site)=&
+                kmc%attempt_frequency*exp(-real(barrier,kind=dp)/kmc%kT)
+            endif
+            kmc%system%sites(site_id)%exchange_states(final_site,initial_site)=EVENT_VALID
+
+            if (kmc%verbosity>=VERBOSITY_LOUD) then
+              write(6,"(a,f10.6,a)") "# E_{m} = ",&
+                kmc%system%sites(site_id)%exchange_barriers(1,final_site,initial_site)," eV"
+              write(6,"(a,f10.6,a)") "# E_{m,reverse} = ",&
+                kmc%system%sites(site_id)%exchange_barriers(2,final_site,initial_site)," eV"
+              write(6,"(a,g10.3,a)") "# rate = ",kmc%system%sites(site_id)%exchange_rates(final_site,initial_site)," Hz"
+            endif
+          endif
+          t2=mpi_wtime()
+          kmc%assigning_time=kmc%assigning_time+t2-t1
         end do
       end do
 
-      if (myrank==0) then
-        if (any(kmc%system%sites(site_id)%exchange_states(:,:)==EVENT_LAE_CHANGED)) then
-          write(0,"(a,i0,a)") "*** Error: site ",site_id," has unchecked exchange events in get_rates()"
-          internal_error=1
-        endif
-        if (internal_error==0) then
-          kmc%system%sites(site_id)%exchange_rate=sum(&
-            kmc%system%sites(site_id)%exchange_rates(:,:),&
-            mask=kmc%system%sites(site_id)%exchange_states(:,:)==EVENT_VALID)
-          kmc%system%sites(site_id)%jumps_checked=.true.
-        endif
+      if (any(kmc%system%sites(site_id)%exchange_states(:,:)==EVENT_LAE_CHANGED)) then
+        write(0,"(a,i0,a)") "*** Error: site ",site_id," has unchecked exchange events in get_rates()"
+        internal_error=1
       endif
-      call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
+      if (internal_error==0) then
+        kmc%system%sites(site_id)%exchange_rate=sum(&
+          kmc%system%sites(site_id)%exchange_rates(:,:),&
+          mask=kmc%system%sites(site_id)%exchange_states(:,:)==EVENT_VALID)
+        kmc%system%sites(site_id)%jumps_checked=.true.
+      endif
       if (internal_error/=0) then
         if (present(error)) then
           error=internal_error
@@ -1296,62 +1238,79 @@ contains
 
     end do
 
-    if (myrank==0) then
-      t1=mpi_wtime()
-    endif
-
-    deallocate(hop_event_states)
-    if (allow_exchange) then
-      deallocate(exchange_event_states)
-    endif
-    if (myrank==0) then
-      deallocate(nn_tmp)
-      deallocate(n_near_tmp)
-      deallocate(site_blocked)
-      kmc%total_rate=RATE_LOWERING_FACTOR**kmc%rate_lowered_times&
-                       *sum(kmc%system%sites(1:kmc%system%n_sites)%hop_rate)+sum(kmc%dep_rate)
-      if (kmc%system%allow_exchange) then
-        kmc%total_rate=kmc%total_rate+RATE_LOWERING_FACTOR**kmc%rate_lowered_times&
-                         *sum(kmc%system%sites(1:kmc%system%n_sites)%exchange_rate)
+    t1=mpi_wtime()
+    ! Sum rates only over deposited_atoms in ascending site_id order to match
+    ! IEEE-754 summation order of sum(sites(1:n_sites)%...) without scanning empty sites.
+    if (n_deposited>0) then
+      if (.not. allocated(dep_sorted)) then
+        allocate(dep_sorted(max(64,n_deposited)))
+      elseif (size(dep_sorted)<n_deposited) then
+        needed_cap=max(size(dep_sorted)*2,n_deposited)
+        deallocate(dep_sorted)
+        allocate(dep_sorted(needed_cap))
       endif
+      dep_sorted(1:n_deposited)=kmc%system%deposited_atoms(1:n_deposited)
+      do k_dep=2,n_deposited
+        dep_key=dep_sorted(k_dep)
+        j_dep=k_dep-1
+        do while (j_dep>=1)
+          if (dep_sorted(j_dep)<=dep_key) exit
+          dep_sorted(j_dep+1)=dep_sorted(j_dep)
+          j_dep=j_dep-1
+        end do
+        dep_sorted(j_dep+1)=dep_key
+      end do
+      hop_sum=0.0_rk
+      exch_sum=0.0_rk
+      do k_dep=1,n_deposited
+        site_id=dep_sorted(k_dep)
+        hop_sum=hop_sum+kmc%system%sites(site_id)%hop_rate
+        if (allow_exchange) then
+          exch_sum=exch_sum+kmc%system%sites(site_id)%exchange_rate
+        endif
+      end do
+    else
+      hop_sum=0.0_rk
+      exch_sum=0.0_rk
+    endif
+    kmc%total_rate=RATE_LOWERING_FACTOR**kmc%rate_lowered_times*hop_sum+sum(kmc%dep_rate)
+    if (kmc%system%allow_exchange) then
+      kmc%total_rate=kmc%total_rate+RATE_LOWERING_FACTOR**kmc%rate_lowered_times*exch_sum
+    endif
+    if (initial_config%initialised) then
       call dealloc_atoms(initial_config)
     endif
-    if (present(error)) then
-      call mpi_bcast(error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-    endif
 
-    if (myrank==0) then
-      t2=mpi_wtime()
-      kmc%get_rates_overhead_time=kmc%get_rates_overhead_time+t2-t1
-    endif
+    t2=mpi_wtime()
+    kmc%get_rates_overhead_time=kmc%get_rates_overhead_time+t2-t1
 
   end subroutine get_rates
 
   subroutine get_barrier(kmc,lmp,site_id,final_id,&
-                         nn_tmp,fingerprint,minim_result,desc_forward,desc_reverse,init,&
-                         final,forward_barrier,reverse_barrier,event_ok,myrank,&
+                         nn_final_val,fingerprint,minim_result,desc_forward,desc_reverse,init,&
+                         forward_barrier,reverse_barrier,event_ok,myrank,&
                          initial_id,shell,error)
     type(t_kmc),intent(inout) :: kmc
     type(lammps),intent(inout) :: lmp
     integer,intent(in) :: site_id,final_id
-    integer,intent(in) :: nn_tmp(kmc%system%n_sites)
+    integer,intent(in) :: nn_final_val
     integer,intent(in) :: fingerprint(kmc%nZ,0:NN_SHELLS),minim_result
     type(descriptor_data) :: desc_forward,desc_reverse
-    type(t_atoms),intent(inout) :: init,final
+    type(t_atoms),intent(inout) :: init
     real(kind=rk),intent(out) :: forward_barrier,reverse_barrier
     logical,intent(out) :: event_ok
     integer,intent(in) :: myrank
     integer,optional,intent(in) :: initial_id,shell
     integer,optional,intent(out) :: error
 
-    type(t_atoms) :: final_config_relaxed
+    type(t_atoms) :: final_config,final_config_relaxed
     double precision :: ml_tol2,zero_tol
     double precision :: neb_forward_barrier,neb_reverse_barrier
     double precision :: ml_forward_barrier,ml_reverse_barrier
     double precision :: forward_variance,reverse_variance
     real(kind=rk) :: displacement2
     double precision,allocatable :: xdata(:)
-    integer :: i,internal_error
+    integer :: i,internal_error,worker_cmd
     double precision :: t1,t2
     integer :: coord_jumping_forward,coord_target_forward,coord_middle
     integer :: coord_jumping_reverse,coord_target_reverse
@@ -1369,42 +1328,41 @@ contains
     internal_error=0
     event_ok=.false.
 
-    if (myrank==0) then
-      ml_tol2=kmc%ml_tol*kmc%ml_tol
-      zero_tol=kmc%neb_error
-      ml_forward_called=.false.
-      ml_reverse_called=.false.
-      forward_data_exists=.false.
-      reverse_data_exists=.false.
-      forward_ml_full=.false.
-      reverse_ml_full=.false.
-      final_relaxed=.false.
-      if (present(shell)) then
-        jump_shell=NN_SHELL_TO_JUMP_SHELL(shell,kmc%system%crystal_structure)
-        if (jump_shell<=0) then
-          write(0,"(a,i0,a)") "*** Error: invalid shell ",shell," doesn't map to an allowed jump shell in get_barrier()"
-          internal_error=1
-        endif
+    ml_tol2=kmc%ml_tol*kmc%ml_tol
+    zero_tol=kmc%neb_error
+    ml_forward_called=.false.
+    ml_reverse_called=.false.
+    forward_data_exists=.false.
+    reverse_data_exists=.false.
+    forward_ml_full=.false.
+    reverse_ml_full=.false.
+    final_relaxed=.false.
+    if (present(shell)) then
+      jump_shell=NN_SHELL_TO_JUMP_SHELL(shell,kmc%system%crystal_structure)
+      if (jump_shell<=0) then
+        write(0,"(a,i0,a)") "*** Error: invalid shell ",shell," doesn't map to an allowed jump shell in get_barrier()"
+        internal_error=1
       endif
-      coord_target_forward=nn_tmp(final_id)
-      coord_target_forward_substrate=kmc%system%sites(final_id)%nn_substrate
-      if (present(initial_id)) then ! Exchange event
-        coord_jumping_forward=kmc%system%sites(initial_id)%nn
-        coord_middle=kmc%system%sites(site_id)%nn
-        coord_target_reverse=nn_tmp(initial_id)
+    endif
+    coord_target_forward=nn_final_val
+    coord_target_forward_substrate=kmc%system%sites(final_id)%nn_substrate
+    if (present(initial_id)) then ! Exchange event
+      coord_jumping_forward=kmc%system%sites(initial_id)%nn
+      coord_middle=kmc%system%sites(site_id)%nn
+      coord_target_reverse=kmc%system%sites(initial_id)%nn
 
-        coord_jumping_forward_substrate=kmc%system%sites(initial_id)%nn_substrate
-        coord_middle_substrate=kmc%system%sites(site_id)%nn_substrate
-        coord_target_reverse_substrate=kmc%system%sites(initial_id)%nn_substrate
-      else ! Hop event
-        coord_jumping_forward=kmc%system%sites(site_id)%nn
-        coord_target_reverse=nn_tmp(site_id)
+      coord_jumping_forward_substrate=kmc%system%sites(initial_id)%nn_substrate
+      coord_middle_substrate=kmc%system%sites(site_id)%nn_substrate
+      coord_target_reverse_substrate=kmc%system%sites(initial_id)%nn_substrate
+    else ! Hop event
+      coord_jumping_forward=kmc%system%sites(site_id)%nn
+      coord_target_reverse=kmc%system%sites(site_id)%nn
 
-        coord_jumping_forward_substrate=kmc%system%sites(site_id)%nn_substrate
-        coord_target_reverse_substrate=kmc%system%sites(site_id)%nn_substrate
-      endif
-      coord_jumping_reverse=nn_tmp(final_id)
-      coord_jumping_reverse_substrate=kmc%system%sites(final_id)%nn_substrate
+      coord_jumping_forward_substrate=kmc%system%sites(site_id)%nn_substrate
+      coord_target_reverse_substrate=kmc%system%sites(site_id)%nn_substrate
+    endif
+    coord_jumping_reverse=nn_final_val
+    coord_jumping_reverse_substrate=kmc%system%sites(final_id)%nn_substrate
 
       if (kmc%verbosity>=VERBOSITY_ABSURD) then
         write(6,"(a,i0)") "# Coordination of the jumping atom: ",coord_jumping_forward
@@ -1426,8 +1384,6 @@ contains
           endif
         endif
       endif
-    endif
-    call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
     if (internal_error/=0) then
       if (present(error)) then
         error=1
@@ -1435,41 +1391,35 @@ contains
       return
     endif
 
-    if (myrank==0) then
-      if (.not. present(initial_id)) then
-        if (.not. kmc%hop_predictor(coord_jumping_forward,coord_target_forward,jump_shell)%initialised) then
-          call initialise_predictor(kmc%hop_predictor(coord_jumping_forward,coord_target_forward,jump_shell),&
-                          kmc%n_data_min,kmc%n_data_max,kmc%n_sparse_max,kmc%desc_str,delta=kmc%delta,zeta=kmc%zeta,&
-                          covariance_type=kmc%covariance_type,regularisation=kmc%regularisation)
-        endif
-        if (.not. kmc%hop_predictor(coord_jumping_reverse,coord_target_reverse,jump_shell)%initialised) then
-          call initialise_predictor(kmc%hop_predictor(coord_jumping_reverse,coord_target_reverse,jump_shell),&
-                          kmc%n_data_min,kmc%n_data_max,kmc%n_sparse_max,kmc%desc_str,delta=kmc%delta,zeta=kmc%zeta,&
-                          covariance_type=kmc%covariance_type,regularisation=kmc%regularisation)
-        endif
-      else
-        if (.not. kmc%exchange_predictor(coord_middle,coord_jumping_forward,&
-                                         coord_target_forward)%initialised) then
-          call initialise_predictor(kmc%exchange_predictor(coord_middle,coord_jumping_forward,&
-                                                           coord_target_forward),&
-                          kmc%n_data_min,kmc%n_data_max,kmc%n_sparse_max,kmc%desc_str,delta=kmc%delta,zeta=kmc%zeta,&
-                          covariance_type=kmc%covariance_type,regularisation=kmc%regularisation)
-        endif
-        if (.not. kmc%exchange_predictor(coord_middle,coord_jumping_reverse,&
-                                         coord_target_reverse)%initialised) then
-          call initialise_predictor(kmc%exchange_predictor(coord_middle,coord_jumping_reverse,&
-                                                           coord_target_reverse),&
-                          kmc%n_data_min,kmc%n_data_max,kmc%n_sparse_max,kmc%desc_str,delta=kmc%delta,zeta=kmc%zeta,&
-                          covariance_type=kmc%covariance_type,regularisation=kmc%regularisation)
-        endif
+    if (.not. present(initial_id)) then
+      if (.not. kmc%hop_predictor(coord_jumping_forward,coord_target_forward,jump_shell)%initialised) then
+        call initialise_predictor(kmc%hop_predictor(coord_jumping_forward,coord_target_forward,jump_shell),&
+                        kmc%n_data_min,kmc%n_data_max,kmc%n_sparse_max,kmc%desc_str,delta=kmc%delta,zeta=kmc%zeta,&
+                        covariance_type=kmc%covariance_type,regularisation=kmc%regularisation)
+      endif
+      if (.not. kmc%hop_predictor(coord_jumping_reverse,coord_target_reverse,jump_shell)%initialised) then
+        call initialise_predictor(kmc%hop_predictor(coord_jumping_reverse,coord_target_reverse,jump_shell),&
+                        kmc%n_data_min,kmc%n_data_max,kmc%n_sparse_max,kmc%desc_str,delta=kmc%delta,zeta=kmc%zeta,&
+                        covariance_type=kmc%covariance_type,regularisation=kmc%regularisation)
+      endif
+    else
+      if (.not. kmc%exchange_predictor(coord_middle,coord_jumping_forward,&
+                                       coord_target_forward)%initialised) then
+        call initialise_predictor(kmc%exchange_predictor(coord_middle,coord_jumping_forward,&
+                                                         coord_target_forward),&
+                        kmc%n_data_min,kmc%n_data_max,kmc%n_sparse_max,kmc%desc_str,delta=kmc%delta,zeta=kmc%zeta,&
+                        covariance_type=kmc%covariance_type,regularisation=kmc%regularisation)
+      endif
+      if (.not. kmc%exchange_predictor(coord_middle,coord_jumping_reverse,&
+                                       coord_target_reverse)%initialised) then
+        call initialise_predictor(kmc%exchange_predictor(coord_middle,coord_jumping_reverse,&
+                                                         coord_target_reverse),&
+                        kmc%n_data_min,kmc%n_data_max,kmc%n_sparse_max,kmc%desc_str,delta=kmc%delta,zeta=kmc%zeta,&
+                        covariance_type=kmc%covariance_type,regularisation=kmc%regularisation)
       endif
     endif
 
-    call mpi_bcast(ml_tol2,1,MPI_DOUBLE,0,MPI_COMM_WORLD,mpi_error)
-    call mpi_bcast(zero_tol,1,MPI_DOUBLE,0,MPI_COMM_WORLD,mpi_error)
-
-    if (myrank==0) then
-      if (.not. present(initial_id)) then ! hop event
+    if (.not. present(initial_id)) then ! hop event
         if (kmc%hop_predictor(coord_jumping_forward,coord_target_forward,jump_shell)%fitted) then
           t1=mpi_wtime()
           call predict(kmc%hop_predictor(coord_jumping_forward,coord_target_forward,jump_shell),&
@@ -1530,8 +1480,6 @@ contains
           write(6,"(a,f10.6,a,f10.6,a)") "# E_{ML,reverse} = ",ml_reverse_barrier," eV, stdev = ",sqrt(reverse_variance)," eV"
         endif
       endif
-    endif
-    call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
     if (internal_error/=0) then
       if (present(error)) then
         error=internal_error
@@ -1539,26 +1487,16 @@ contains
       return
     endif
 
-    call mpi_bcast(ml_forward_called,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_error)
-    call mpi_bcast(ml_reverse_called,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_error)
-    call mpi_bcast(ml_forward_barrier,1,MPI_DOUBLE,0,MPI_COMM_WORLD,mpi_error)
-    call mpi_bcast(forward_variance,1,MPI_DOUBLE,0,MPI_COMM_WORLD,mpi_error)
-    call mpi_bcast(ml_reverse_barrier,1,MPI_DOUBLE,0,MPI_COMM_WORLD,mpi_error)
-    call mpi_bcast(reverse_variance,1,MPI_DOUBLE,0,MPI_COMM_WORLD,mpi_error)
-
     if (ml_forward_called .and. ml_reverse_called &
         .and. forward_variance<ml_tol2 .and. ml_forward_barrier==ml_forward_barrier .and. ml_forward_barrier>=-zero_tol &
         .and. reverse_variance<ml_tol2 .and. ml_reverse_barrier==ml_reverse_barrier .and. ml_reverse_barrier>=-zero_tol) then
-      if (myrank==0) then
-        forward_barrier=ml_forward_barrier
-        reverse_barrier=ml_reverse_barrier
-        if (reverse_barrier>0.0_rk) then
-          event_ok=.true.
-        endif
+      forward_barrier=ml_forward_barrier
+      reverse_barrier=ml_reverse_barrier
+      if (reverse_barrier>0.0_rk) then
+        event_ok=.true.
       endif
     else
-      if (myrank==0) then
-        if (.not. present(initial_id)) then ! hop event
+      if (.not. present(initial_id)) then ! hop event
           forward_data_exists=data_point_exists(kmc%hop_predictor(coord_jumping_forward,coord_target_forward,jump_shell),&
                                                 desc_forward%x(1)%data(:),y=neb_forward_barrier)
           reverse_data_exists=data_point_exists(kmc%hop_predictor(coord_jumping_reverse,coord_target_reverse,jump_shell),&
@@ -1627,14 +1565,22 @@ contains
             if (kmc%minim_cache_index>MINIM_CACHE_SIZE) then
               kmc%minim_cache_index=1
             endif
+            ! Construct final_config lazily only when running minimization
             kmc%minim_cache(:,:,kmc%minim_cache_index)=fingerprint
+            final_config=init
+            final_config%pos(:,kmc%system%sites(site_id)%id)=&
+              kmc%system%sites(final_id)%cartesian_coords(:)
+            if (present(initial_id)) then
+              final_config%pos(:,kmc%system%sites(initial_id)%id)=&
+                kmc%system%sites(site_id)%cartesian_coords(:)
+            endif
             call lmp%create_atoms(id=[(i,i=kmc%system%substrate%first_id,kmc%system%substrate%last_id)],&
                                   type=kmc%system%substrate%atom_type,&
                                   x=reshape(real(kmc%system%substrate%pos,kind=dp),&
                                   [3*(kmc%system%substrate%last_id-kmc%system%substrate%first_id+1)]))
-            call lmp%create_atoms(id=[(i,i=final%first_id,final%last_id)],&
-                                  type=final%atom_type,&
-                                  x=reshape(real(final%pos,kind=dp),[3*(final%last_id-final%first_id+1)]))
+            call lmp%create_atoms(id=[(i,i=final_config%first_id,final_config%last_id)],&
+                                  type=final_config%atom_type,&
+                                  x=reshape(real(final_config%pos,kind=dp),[3*(final_config%last_id-final_config%first_id+1)]))
             call lmp%command("group mobile subtract all frozen")
             t1=mpi_wtime()
             call lmp%command("minimize "//kmc%relax_tol//" "//0.1d0*kmc%relax_tol//" "//kmc%neb_steps//" "//10*kmc%neb_steps)
@@ -1642,9 +1588,9 @@ contains
             kmc%minimizations=kmc%minimizations+1
             t2=mpi_wtime()
             kmc%minimize_time=kmc%minimize_time+t2-t1
-            call lmp%gather_atoms_subset("x",3,[(i,i=final%first_id,final%last_id)],xdata)
+            call lmp%gather_atoms_subset("x",3,[(i,i=final_config%first_id,final_config%last_id)],xdata)
             call lmp%command("delete_atoms group mobile")
-            final_config_relaxed=final
+            final_config_relaxed=final_config
             final_config_relaxed%pos=reshape(xdata,shape(final_config_relaxed%pos))
             deallocate(xdata)
             n_check_list=1
@@ -1708,7 +1654,8 @@ contains
                 end do
               endif
             end do
-            displacement2=max_displacement2(final,final_config_relaxed,check_list,n_check_list)
+            displacement2=max_displacement2(final_config,final_config_relaxed,check_list,n_check_list)
+            call dealloc_atoms(final_config)
             call dealloc_atoms(final_config_relaxed)
             if (displacement2<kmc%system%relax_displacement_tol2) then
               final_relaxed=.true.
@@ -1727,23 +1674,18 @@ contains
             endif
           endif
         endif
-      endif
-      call mpi_bcast(final_relaxed,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_error)
-      call mpi_bcast(forward_data_exists,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_error)
-      call mpi_bcast(reverse_data_exists,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_error)
-      call mpi_bcast(forward_ml_full,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_error)
-      call mpi_bcast(reverse_ml_full,1,MPI_LOGICAL,0,MPI_COMM_WORLD,mpi_error)
       if ((.not. forward_data_exists .and. .not. forward_ml_full) .or. &
           (.not. reverse_data_exists .and. .not. reverse_ml_full)) then
         if (.not. final_relaxed) then
           return
         endif
-        if (myrank==0) then
-          if (kmc%verbosity>=VERBOSITY_NORMAL) then
-            write(6,"(a)") "# Running NEB..."
-          endif
-          t1=mpi_wtime()
+        if (kmc%verbosity>=VERBOSITY_NORMAL) then
+          write(6,"(a)") "# Running NEB..."
         endif
+        t1=mpi_wtime()
+        ! Wake workers only for actual NEB execution across all MPI ranks
+        worker_cmd=1
+        call mpi_bcast(worker_cmd,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
         if (.not. present(initial_id)) then
           call neb_barrier(kmc,lmp,site_id,final_id,init,&
                            neb_forward_barrier,neb_reverse_barrier,myrank)
@@ -1752,13 +1694,10 @@ contains
                            neb_forward_barrier,neb_reverse_barrier,myrank,&
                            initial_id=initial_id)
         endif
-        if (myrank==0) then
-          t2=mpi_wtime()
-          kmc%neb_barrier_time=kmc%neb_barrier_time+t2-t1
-        endif
+        t2=mpi_wtime()
+        kmc%neb_barrier_time=kmc%neb_barrier_time+t2-t1
       endif
-      if (myrank==0) then
-        if (.not. forward_ml_full .or. .not. reverse_ml_full) then
+      if (.not. forward_ml_full .or. .not. reverse_ml_full) then
           if (kmc%verbosity>=VERBOSITY_ABSURD) then
             write(6,"(a,f10.6,a)") "# E_{NEB} = ",neb_forward_barrier," eV"
             write(6,"(a,f10.6,a)") "# E_{NEB,reverse} = ",neb_reverse_barrier," eV"
@@ -1896,11 +1835,6 @@ contains
           endif
         endif
       endif
-    endif
-
-    if (present(error)) then
-      call mpi_bcast(error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-    endif
 
   end subroutine get_barrier
 
@@ -2345,6 +2279,11 @@ contains
         nn_id=kmc%system%sites(final_id)%neighbour_shells(shell)%neighbour_sites(nn_atom)
         if (shell<TRUE_1NN_SHELL(kmc%system%crystal_structure)) then
           kmc%system%sites(nn_id)%n_near=kmc%system%sites(nn_id)%n_near+1
+          ! Lower first_dynamic_site if a lower non-initial site ever exceeds n_near > 1
+          if (nn_id<kmc%system%first_dynamic_site .and. kmc%system%sites(nn_id)%n_near>1 .and. &
+              .not. kmc%system%sites(nn_id)%initial_site) then
+            kmc%system%first_dynamic_site=nn_id
+          endif
         elseif (shell==TRUE_1NN_SHELL(kmc%system%crystal_structure)) then
           kmc%system%sites(nn_id)%nn=kmc%system%sites(nn_id)%nn+1
           if (.not. kmc%system%sites(nn_id)%substrate) then
@@ -2714,8 +2653,8 @@ contains
       endif
     endif
 
-    ! Update lockedness
-    kmc%system%sites(1:kmc%system%n_sites)%lock_checked=.false.
+    ! Update lockedness (clear only previously marked dirty sites instead of 1:n_sites)
+    call clear_lock_checked(kmc%system)
 
     call check_lockedness(kmc%system,final_id,error=internal_error)
     if (internal_error/=0) then
@@ -2727,6 +2666,7 @@ contains
       return
     endif
     kmc%system%sites(final_id)%lock_checked=.true.
+    call push_lock_dirty(kmc%system,final_id)
 
     call do_lockedness_checks(kmc%system,final_id,error=internal_error)
     if (internal_error/=0) then

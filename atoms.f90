@@ -133,7 +133,6 @@ contains
     else
       system%periodic=.true.
     endif
-    allocate(system%sites(BUFFER_SIZE))
 
     system%frozen_substrate%first_id=1
     system%frozen_substrate%last_id=ATOMS_IN_LAYER(orientation,crystal_structure)*xmax*ymax
@@ -150,6 +149,8 @@ contains
     else
       system%substrate%last_id=P_MAX(orientation,crystal_structure)*xmax*ymax*substrate_layers
     endif
+    ! Pre-allocate sites up front (2x substrate count covers initial adsorption sites + headroom)
+    allocate(system%sites(max(BUFFER_SIZE,2*system%substrate%last_id)))
     allocate(system%substrate%pos(3,system%substrate%first_id:system%substrate%last_id))
     system%substrate%pos=0.0d0
     allocate(system%substrate%atom_type(system%substrate%first_id:system%substrate%last_id))
@@ -1005,9 +1006,10 @@ contains
       return
     endif
 
-    allocate(system%sites(i)%neighbour_shells(dist_index)%neighbour_sites(NN_BUFFER_SIZE))
+    ! Start shells with >= 12 slots so 1NN lists avoid repeated 3->6->9->12 reallocations
+    allocate(system%sites(i)%neighbour_shells(dist_index)%neighbour_sites(max(NN_BUFFER_SIZE,12)))
     system%sites(i)%neighbour_shells(dist_index)%neighbour_sites=0
-    allocate(system%sites(i)%neighbour_shells(dist_index)%reverse_indices(NN_BUFFER_SIZE))
+    allocate(system%sites(i)%neighbour_shells(dist_index)%reverse_indices(max(NN_BUFFER_SIZE,12)))
     system%sites(i)%neighbour_shells(dist_index)%reverse_indices=0
     system%sites(i)%neighbour_shells(dist_index)%initialised=.true.
   end subroutine initialise_neighbour_shell
@@ -1572,6 +1574,7 @@ contains
             return
           endif
           system%sites(nn_id)%lock_checked=.true.
+          call push_lock_dirty(system,nn_id)
         endif
         do nn_nn_atom=1,system%sites(nn_id)%neighbour_shells(TRUE_1NN_SHELL(system%crystal_structure))%n_neighbour_sites
           nn_nn_id=system%sites(nn_id)%neighbour_shells(TRUE_1NN_SHELL(system%crystal_structure))%neighbour_sites(nn_nn_atom)
@@ -1587,6 +1590,7 @@ contains
                 return
               endif
               system%sites(nn_nn_id)%lock_checked=.true.
+              call push_lock_dirty(system,nn_nn_id)
             endif
           endif
         end do
@@ -2117,6 +2121,9 @@ contains
       read(fileunit,*) system%sites(i)%inactive_counter
       read(fileunit,*) system%sites(i)%locked
       read(fileunit,*) system%sites(i)%lock_checked
+      if (system%sites(i)%lock_checked) then
+        call push_lock_dirty(system,i)
+      endif
       read(fileunit,*) system%sites(i)%jumps_checked
       read(fileunit,*) system%sites(i)%substrate
       read(fileunit,*) system%sites(i)%initial_site
@@ -2974,6 +2981,11 @@ contains
         nn_id=system%sites(dep_id)%neighbour_shells(shell)%neighbour_sites(nn_atom)
         if (shell<TRUE_1NN_SHELL(system%crystal_structure)) then
           system%sites(nn_id)%n_near=system%sites(nn_id)%n_near+1
+          ! Lower first_dynamic_site if a lower non-initial site ever exceeds n_near > 1
+          if (nn_id<system%first_dynamic_site .and. system%sites(nn_id)%n_near>1 .and. &
+              .not. system%sites(nn_id)%initial_site) then
+            system%first_dynamic_site=nn_id
+          endif
         elseif (shell==TRUE_1NN_SHELL(system%crystal_structure)) then
           system%sites(nn_id)%nn=system%sites(nn_id)%nn+1
           if (.not. system%sites(nn_id)%substrate) then
@@ -3060,7 +3072,7 @@ contains
       endif
     endif
 
-    system%sites(1:system%n_sites)%lock_checked=.false.
+    call clear_lock_checked(system)
     call check_lockedness(system,dep_id,error=internal_error)
     if (internal_error/=0) then
       write(0,"(a,i0,a)") "*** Error checking lockedness of site ",&
@@ -3071,6 +3083,7 @@ contains
       return
     endif
     system%sites(dep_id)%lock_checked=.true.
+    call push_lock_dirty(system,dep_id)
 
     call do_lockedness_checks(system,dep_id,error=internal_error)
     if (internal_error/=0) then
@@ -3567,6 +3580,9 @@ contains
     endif
 
     system%sites(id)=system%sites(system%n_sites)
+    if (id/=system%n_sites .and. system%sites(id)%lock_checked) then
+      call push_lock_dirty(system,id)
+    endif
 
     ! Deallocate memory and de-initialise the site
     system%sites(system%n_sites)%Z=-1
@@ -3651,5 +3667,42 @@ contains
     end do
 
   end function site_is_fcc
+
+  subroutine push_lock_dirty(system,i)
+    ! Track sites whose lock_checked was set to .true. so clear_lock_checked() only clears those
+    type(t_system),intent(inout) :: system
+    integer,intent(in) :: i
+
+    integer,allocatable :: tmp(:)
+    integer :: new_cap
+
+    if (.not. allocated(system%lock_dirty_sites)) then
+      allocate(system%lock_dirty_sites(256))
+    elseif (system%n_lock_dirty>=size(system%lock_dirty_sites)) then
+      new_cap=size(system%lock_dirty_sites)*2
+      allocate(tmp(new_cap))
+      tmp(1:system%n_lock_dirty)=system%lock_dirty_sites(1:system%n_lock_dirty)
+      call move_alloc(tmp,system%lock_dirty_sites)
+    endif
+    system%n_lock_dirty=system%n_lock_dirty+1
+    system%lock_dirty_sites(system%n_lock_dirty)=i
+
+  end subroutine push_lock_dirty
+
+  subroutine clear_lock_checked(system)
+    ! O(dirty) replacement for system%sites(1:n_sites)%lock_checked = .false.
+    type(t_system),intent(inout) :: system
+
+    integer :: k,idx
+
+    do k=1,system%n_lock_dirty
+      idx=system%lock_dirty_sites(k)
+      if (idx>=1 .and. idx<=system%n_sites) then
+        system%sites(idx)%lock_checked=.false.
+      endif
+    end do
+    system%n_lock_dirty=0
+
+  end subroutine clear_lock_checked
 
 end module mlkmc_atoms_module

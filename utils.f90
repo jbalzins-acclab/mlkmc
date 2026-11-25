@@ -266,7 +266,8 @@ contains
     allocate(array_tmp(l(1):u(1)))
     array_tmp=array
     deallocate(array)
-    allocate(array(l(1):u(1)+my_buffer_size))
+    ! Exponential (2x) growth keeps amortized append cost O(1) (e.g., neighbour shells, boxes, ML data)
+    allocate(array(l(1):u(1)+max(u(1)-l(1)+1,my_buffer_size)))
     if (present(default_value)) then
       array=default_value
     endif
@@ -280,7 +281,7 @@ contains
     integer,optional,intent(out) :: error
 
     type(t_site),allocatable :: array_tmp(:)
-    integer :: s
+    integer :: s,new_s,idx,sh
 
     if (present(error)) then
       error=0
@@ -295,13 +296,51 @@ contains
     endif
 
     s=size(array)
+    ! Grow capacity exponentially (2x) instead of +BUFFER_SIZE to avoid O(N^2) resizes
+    new_s=s+max(s,BUFFER_SIZE)
 
-    allocate(array_tmp(s))
-    array_tmp=array
-    deallocate(array)
-    allocate(array(s+BUFFER_SIZE))
-    array(1:s)=array_tmp
-    deallocate(array_tmp)
+    ! Move component allocatables via move_alloc instead of whole-array deep assignment
+    ! (avoids re-allocating/freeing every site's 16 neighbour_shells twice per resize).
+    allocate(array_tmp(new_s))
+    do idx=1,s
+      array_tmp(idx)%Z=array(idx)%Z
+      array_tmp(idx)%nn=array(idx)%nn
+      array_tmp(idx)%n_near=array(idx)%n_near
+      array_tmp(idx)%atom_type=array(idx)%atom_type
+      array_tmp(idx)%id=array(idx)%id
+      array_tmp(idx)%max_nn=array(idx)%max_nn
+      array_tmp(idx)%nn_substrate=array(idx)%nn_substrate
+      array_tmp(idx)%inactive_counter=array(idx)%inactive_counter
+      array_tmp(idx)%locked=array(idx)%locked
+      array_tmp(idx)%lock_checked=array(idx)%lock_checked
+      array_tmp(idx)%jumps_checked=array(idx)%jumps_checked
+      array_tmp(idx)%substrate=array(idx)%substrate
+      array_tmp(idx)%initial_site=array(idx)%initial_site
+      array_tmp(idx)%cartesian_coords=array(idx)%cartesian_coords
+      array_tmp(idx)%my_box=array(idx)%my_box
+      array_tmp(idx)%my_index_in_box=array(idx)%my_index_in_box
+      array_tmp(idx)%hop_rate=array(idx)%hop_rate
+      array_tmp(idx)%exchange_rate=array(idx)%exchange_rate
+      do sh=1,NN_SHELLS
+        array_tmp(idx)%neighbour_shells(sh)%initialised=array(idx)%neighbour_shells(sh)%initialised
+        array_tmp(idx)%neighbour_shells(sh)%n_neighbour_sites=array(idx)%neighbour_shells(sh)%n_neighbour_sites
+        if (allocated(array(idx)%neighbour_shells(sh)%neighbour_sites)) then
+          call move_alloc(array(idx)%neighbour_shells(sh)%neighbour_sites, &
+                          array_tmp(idx)%neighbour_shells(sh)%neighbour_sites)
+        endif
+        if (allocated(array(idx)%neighbour_shells(sh)%reverse_indices)) then
+          call move_alloc(array(idx)%neighbour_shells(sh)%reverse_indices, &
+                          array_tmp(idx)%neighbour_shells(sh)%reverse_indices)
+        endif
+      end do
+      if (allocated(array(idx)%hop_states)) call move_alloc(array(idx)%hop_states, array_tmp(idx)%hop_states)
+      if (allocated(array(idx)%hop_barriers)) call move_alloc(array(idx)%hop_barriers, array_tmp(idx)%hop_barriers)
+      if (allocated(array(idx)%hop_rates)) call move_alloc(array(idx)%hop_rates, array_tmp(idx)%hop_rates)
+      if (allocated(array(idx)%exchange_states)) call move_alloc(array(idx)%exchange_states, array_tmp(idx)%exchange_states)
+      if (allocated(array(idx)%exchange_barriers)) call move_alloc(array(idx)%exchange_barriers, array_tmp(idx)%exchange_barriers)
+      if (allocated(array(idx)%exchange_rates)) call move_alloc(array(idx)%exchange_rates, array_tmp(idx)%exchange_rates)
+    end do
+    call move_alloc(array_tmp, array)
 
   end subroutine size_up_sites
 
@@ -396,7 +435,8 @@ contains
     allocate(array_tmp(l(1):u(1)))
     array_tmp=array
     deallocate(array)
-    allocate(array(l(1):u(1)+my_buffer_size))
+    ! Exponential (2x) growth keeps amortized append cost O(1) (e.g., neighbour shells, boxes, ML data)
+    allocate(array(l(1):u(1)+max(u(1)-l(1)+1,my_buffer_size)))
     if (present(default_value)) then
       array=default_value
     endif
@@ -437,7 +477,8 @@ contains
     allocate(array_tmp(l(1):u(1)))
     array_tmp=array
     deallocate(array)
-    allocate(array(l(1):u(1)+my_buffer_size))
+    ! Exponential (2x) growth keeps amortized append cost O(1) (e.g., neighbour shells, boxes, ML data)
+    allocate(array(l(1):u(1)+max(u(1)-l(1)+1,my_buffer_size)))
     if (present(default_value)) then
       array=default_value
     endif

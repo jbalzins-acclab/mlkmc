@@ -82,6 +82,13 @@ module mlkmc_atoms_types_module
 
     logical :: allow_exchange=.true.
     logical :: periodic(3)=.false.
+
+    ! Performance-tracking state (keeps bit-identical behavior while avoiding O(n_sites) scans):
+    ! - first_dynamic_site: lowest site index that can satisfy the inactive_counter update predicate
+    ! - n_lock_dirty / lock_dirty_sites: sparse list of sites with lock_checked == .true.
+    integer :: first_dynamic_site=1
+    integer :: n_lock_dirty=0
+    integer,allocatable :: lock_dirty_sites(:)
   end type t_system
 
 end module mlkmc_atoms_types_module
