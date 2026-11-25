@@ -352,7 +352,7 @@ contains
     integer,optional,intent(out) :: error
 
     integer,allocatable :: array_tmp(:,:)
-    integer :: l(2),u(2),my_buffer_size
+    integer :: l(2),u(2),my_buffer_size,g1,g2
 
     if (present(error)) then
       error=0
@@ -373,6 +373,9 @@ contains
 
     l=lbound(array)
     u=ubound(array)
+    ! Match 1D exponential (2x) growth so co-resized 1D/2D arrays stay equal in capacity
+    g1=max(u(1)-l(1)+1,my_buffer_size)
+    g2=max(u(2)-l(2)+1,my_buffer_size)
 
     allocate(array_tmp(l(1):u(1),l(2):u(2)))
     array_tmp=array
@@ -380,11 +383,11 @@ contains
     if (present(rank)) then
       select case(rank)
         case(RANK_FIRST)
-          allocate(array(l(1):u(1)+my_buffer_size,l(2):u(2)))
+          allocate(array(l(1):u(1)+g1,l(2):u(2)))
         case(RANK_SECOND)
-          allocate(array(l(1):u(1),l(2):u(2)+my_buffer_size))
+          allocate(array(l(1):u(1),l(2):u(2)+g2))
         case(RANK_ALL)
-          allocate(array(l(1):u(1)+my_buffer_size,l(2):u(2)+my_buffer_size))
+          allocate(array(l(1):u(1)+g1,l(2):u(2)+g2))
         case default
           write(0,"(a,i0,a)") "*** Error: unknown rank ",rank," in size_up_int_2D"
           if (present(error)) then
@@ -393,7 +396,7 @@ contains
           return
       end select
     else
-      allocate(array(l(1):u(1),l(2):u(2)+my_buffer_size))
+      allocate(array(l(1):u(1),l(2):u(2)+g2))
     endif
     if (present(default_value)) then
       array=default_value
@@ -495,7 +498,7 @@ contains
     integer,optional,intent(out) :: error
 
     real(kind=rk),allocatable :: array_tmp(:,:)
-    integer :: l(2),u(2),my_buffer_size
+    integer :: l(2),u(2),my_buffer_size,g1,g2
 
     if (present(error)) then
       error=0
@@ -517,6 +520,9 @@ contains
 
     l=lbound(array)
     u=ubound(array)
+    ! Match 1D exponential (2x) growth so co-resized arrays stay equal in capacity
+    g1=max(u(1)-l(1)+1,my_buffer_size)
+    g2=max(u(2)-l(2)+1,my_buffer_size)
 
     allocate(array_tmp(l(1):u(1),l(2):u(2)))
     array_tmp=array
@@ -524,11 +530,11 @@ contains
     if (present(rank)) then
       select case(rank)
         case(RANK_FIRST)
-          allocate(array(l(1):u(1)+my_buffer_size,l(2):u(2)))
+          allocate(array(l(1):u(1)+g1,l(2):u(2)))
         case(RANK_SECOND)
-          allocate(array(l(1):u(1),l(2):u(2)+my_buffer_size))
+          allocate(array(l(1):u(1),l(2):u(2)+g2))
         case(RANK_ALL)
-          allocate(array(l(1):u(1)+my_buffer_size,l(2):u(2)+my_buffer_size))
+          allocate(array(l(1):u(1)+g1,l(2):u(2)+g2))
         case default
           write(0,"(a,i0,a)") "*** Error: unknown rank ",rank," in size_up_real_2D"
           if (present(error)) then
@@ -537,7 +543,7 @@ contains
           return
       end select
     else
-      allocate(array(l(1):u(1),l(2):u(2)+my_buffer_size))
+      allocate(array(l(1):u(1),l(2):u(2)+g2))
     endif
     if (present(default_value)) then
       array=default_value
@@ -555,7 +561,7 @@ contains
     integer,optional,intent(out) :: error
 
     double precision,allocatable :: array_tmp(:,:)
-    integer :: l(2),u(2),my_buffer_size
+    integer :: l(2),u(2),my_buffer_size,g1,g2
 
     if (present(error)) then
       error=0
@@ -577,6 +583,9 @@ contains
 
     l=lbound(array)
     u=ubound(array)
+    ! Match 1D exponential (2x) growth so co-resized 1D/2D arrays (e.g. ML predictor%x vs %y) stay equal in capacity
+    g1=max(u(1)-l(1)+1,my_buffer_size)
+    g2=max(u(2)-l(2)+1,my_buffer_size)
 
     allocate(array_tmp(l(1):u(1),l(2):u(2)))
     array_tmp=array
@@ -584,11 +593,11 @@ contains
     if (present(rank)) then
       select case(rank)
         case(RANK_FIRST)
-          allocate(array(l(1):u(1)+my_buffer_size,l(2):u(2)))
+          allocate(array(l(1):u(1)+g1,l(2):u(2)))
         case(RANK_SECOND)
-          allocate(array(l(1):u(1),l(2):u(2)+my_buffer_size))
+          allocate(array(l(1):u(1),l(2):u(2)+g2))
         case(RANK_ALL)
-          allocate(array(l(1):u(1)+my_buffer_size,l(2):u(2)+my_buffer_size))
+          allocate(array(l(1):u(1)+g1,l(2):u(2)+g2))
         case default
           write(0,"(a,i0,a)") "*** Error: unknown rank ",rank," in size_up_double_2D"
           if (present(error)) then
@@ -597,7 +606,7 @@ contains
           return
       end select
     else
-      allocate(array(l(1):u(1),l(2):u(2)+my_buffer_size))
+      allocate(array(l(1):u(1),l(2):u(2)+g2))
     endif
     if (present(default_value)) then
       array=default_value
@@ -615,7 +624,7 @@ contains
     integer,optional,intent(out) :: error
 
     real(kind=rk),allocatable :: array_tmp(:,:,:)
-    integer :: l(3),u(3),my_buffer_size
+    integer :: l(3),u(3),my_buffer_size,g1,g2,g3
 
     if (present(error)) then
       error=0
@@ -637,6 +646,10 @@ contains
 
     l=lbound(array)
     u=ubound(array)
+    ! Match 2D exponential (2x) growth so hop/exchange 2D and 3D event arrays stay equal in capacity
+    g1=max(u(1)-l(1)+1,my_buffer_size)
+    g2=max(u(2)-l(2)+1,my_buffer_size)
+    g3=max(u(3)-l(3)+1,my_buffer_size)
 
     allocate(array_tmp(l(1):u(1),l(2):u(2),l(3):u(3)))
     array_tmp=array
@@ -644,15 +657,15 @@ contains
     if (present(rank)) then
       select case(rank)
         case(RANK_FIRST)
-          allocate(array(l(1):u(1)+my_buffer_size,l(2):u(2),l(3):u(3)))
+          allocate(array(l(1):u(1)+g1,l(2):u(2),l(3):u(3)))
         case(RANK_SECOND)
-          allocate(array(l(1):u(1),l(2):u(2)+my_buffer_size,l(3):u(3)))
+          allocate(array(l(1):u(1),l(2):u(2)+g2,l(3):u(3)))
         case(RANK_THIRD)
-          allocate(array(l(1):u(1),l(2):u(2),l(3):u(3)+my_buffer_size))
+          allocate(array(l(1):u(1),l(2):u(2),l(3):u(3)+g3))
         case(RANK_LAST_TWO)
-          allocate(array(l(1):u(1),l(2):u(2)+my_buffer_size,l(3):u(3)+my_buffer_size))
+          allocate(array(l(1):u(1),l(2):u(2)+g2,l(3):u(3)+g3))
         case(RANK_ALL)
-          allocate(array(l(1):u(1)+my_buffer_size,l(2):u(2)+my_buffer_size,l(3):u(3)+my_buffer_size))
+          allocate(array(l(1):u(1)+g1,l(2):u(2)+g2,l(3):u(3)+g3))
         case default
           write(0,"(a,i0,a)") "*** Error: unknown rank ",rank," in size_up_real_3D"
           if (present(error)) then
@@ -661,7 +674,7 @@ contains
           return
       end select
     else
-      allocate(array(l(1):u(1),l(2):u(2),l(3):u(3)+my_buffer_size))
+      allocate(array(l(1):u(1),l(2):u(2),l(3):u(3)+g3))
     endif
     if (present(default_value)) then
       array=default_value
@@ -697,7 +710,8 @@ contains
     allocate(array_tmp(l(1):u(1),l(2):u(2),l(3):u(3),l(4):u(4)))
     array_tmp=array
     deallocate(array)
-    allocate(array(l(1):u(1)+BUFFER_SIZE,l(2):u(2),l(3):u(3),l(4):u(4)))
+    ! Exponential (2x) growth consistent with other size_up routines
+    allocate(array(l(1):u(1)+max(u(1)-l(1)+1,BUFFER_SIZE),l(2):u(2),l(3):u(3),l(4):u(4)))
     if (present(default_value)) then
       array=default_value
     endif
@@ -744,7 +758,8 @@ contains
     allocate(array_tmp(l(1):u(1)))
     array_tmp=array
     deallocate(array)
-    allocate(array(l(1):u(1)+BUFFER_SIZE))
+    ! Exponential (2x) growth consistent with other size_up routines
+    allocate(array(l(1):u(1)+max(u(1)-l(1)+1,BUFFER_SIZE)))
     if (present(default_value)) then
       array=default_value
     endif

@@ -560,7 +560,8 @@ contains
     logical,allocatable,save :: site_blocked(:)
     integer,allocatable,save :: blocked_sites(:),dep_sorted(:)
     integer,allocatable,save :: hop_event_states(:,:),exchange_event_states(:,:)
-    integer :: n_blocked,k_dep,dep_key,j_dep,s_chk,k_chk,needed_cap
+    integer,save :: n_blocked=0
+    integer :: k_dep,dep_key,j_dep,s_chk,k_chk,needed_cap
     logical,allocatable :: tmp_blocked(:)
     integer,allocatable :: tmp_idx(:)
     real(kind=rk) :: hop_sum,exch_sum
@@ -589,7 +590,13 @@ contains
     t1=mpi_wtime()
     ! Defer get_atoms() copy until get_barrier() actually needs minim/NEB coordinates
     initial_config%initialised=.false.
-    n_blocked=0
+    ! Reset any leftover blocked flags if a prior invocation exited early on error
+    if (n_blocked>0 .and. allocated(site_blocked)) then
+      do k_chk=1,n_blocked
+        site_blocked(blocked_sites(k_chk))=.false.
+      end do
+      n_blocked=0
+    endif
 
     if (.not. allocated(site_blocked)) then
       needed_cap=max(kmc%system%n_sites+1024,1024)
@@ -722,7 +729,7 @@ contains
                   n_near_final=n_near_final-1
                 endif
                 ! Adjust final_id's nn/n_near for vacated initial_id via local shell lookup (O(1) vs n_sites copy)
-          nn_final=kmc%system%sites(final_id)%nn
+                nn_final=kmc%system%sites(final_id)%nn
                 if (shell==TRUE_1NN_SHELL(crystal_structure)) then
                   nn_final=nn_final-1
                 endif

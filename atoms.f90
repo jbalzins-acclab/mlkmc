@@ -3583,6 +3583,9 @@ contains
     if (id/=system%n_sites .and. system%sites(id)%lock_checked) then
       call push_lock_dirty(system,id)
     endif
+    if (id<system%first_dynamic_site .and. .not. system%sites(id)%initial_site) then
+      system%first_dynamic_site=id
+    endif
 
     ! Deallocate memory and de-initialise the site
     system%sites(system%n_sites)%Z=-1
