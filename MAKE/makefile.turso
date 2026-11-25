@@ -19,7 +19,8 @@ include MAKE/makefile.defs
 
 FC=mpifort
 QUIP_ARCH=linux_x86_64_gfortran_openmpi
-FLAGS+=-O2 -fallow-argument-mismatch
+# Optimization flags (-O3 -march=native) are inherited from MAKE/makefile.defs
+FLAGS+=-fallow-argument-mismatch
 LIB+=-llapack -lopenblas
 LIB_INCLUDE+=-LQUIP/build/${QUIP_ARCH}
 INCLUDE+=-IQUIP/build/${QUIP_ARCH}

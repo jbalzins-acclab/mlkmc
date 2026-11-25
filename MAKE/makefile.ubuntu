@@ -19,7 +19,7 @@ include MAKE/makefile.defs
 
 FC=mpifort
 QUIP_ARCH=linux_x86_64_gfortran
-FLAGS+=-O2
+# Optimization flags (-O3 -march=native) are inherited from MAKE/makefile.defs
 LIB+=-llapack -lblas
 LIB_INCLUDE+=-LQUIP/build/${QUIP_ARCH}
 INCLUDE+=-IQUIP/build/${QUIP_ARCH}

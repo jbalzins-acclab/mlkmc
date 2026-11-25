@@ -19,7 +19,8 @@ include MAKE/makefile.defs
 
 FC=mpiifort
 QUIP_ARCH=linux_x86_64_ifort_icc_avon_intelmpi
-FLAGS+=-O2 -DINTEL_COMPILER
+# Drop GCC-specific -march=native for Intel compilers while keeping -O3 from MAKE/makefile.defs
+FLAGS:=$(filter-out -march=native,$(FLAGS)) -DINTEL_COMPILER
 LIB+=-lmkl_scalapack_lp64 \
      -lmkl_intel_lp64 -lmkl_sequential -lmkl_core \
      -lmkl_blacs_intelmpi_lp64 -lpthread -lm -ldl

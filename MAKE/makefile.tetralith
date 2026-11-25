@@ -19,7 +19,8 @@ include MAKE/makefile.defs
 
 FC=mpif90
 QUIP_ARCH=linux_x86_64_ifort_icc
-FLAGS+=-O2 -DINTEL_COMPILER
+# Drop GCC-specific -march=native for Intel compilers while keeping -O3 from MAKE/makefile.defs
+FLAGS:=$(filter-out -march=native,$(FLAGS)) -DINTEL_COMPILER
 LIB+=-qmkl=sequential
 LIB_INCLUDE+=-LQUIP/build/${QUIP_ARCH}
 INCLUDE+=-IQUIP/build/${QUIP_ARCH}

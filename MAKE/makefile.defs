@@ -15,7 +15,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-FLAGS=-cpp -fopenmp -O2
+# Default to -O3 -march=native (without -ffast-math to preserve FP reproducibility)
+FLAGS=-cpp -fopenmp -O3 -march=native
 LIB=-lFoX_sax -lFoX_wxml -lgap -lquip -llammps
 LIB_INCLUDE=-LQUIP/src/fox/wxml -LQUIP/src/fox/sax -Llammps/src
 INCLUDE=-IQUIP/src/fox/wxml -IQUIP/src/fox/sax -Ilammps/src
