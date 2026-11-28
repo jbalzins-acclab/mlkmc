@@ -17,10 +17,10 @@
 
 # Default to -O3 -march=native (without -ffast-math to preserve FP reproducibility)
 FLAGS=-cpp -fopenmp -O3 -march=native
-LIB=-lFoX_sax -lFoX_wxml -lgap -lquip -llammps
-LIB_INCLUDE=-LQUIP/src/fox/wxml -LQUIP/src/fox/sax -Llammps/src
+LIB=-lFoX_sax -lFoX_wxml -lgap -lquip -llammps -lSwiftMDC
+LIB_INCLUDE=-LQUIP/src/fox/wxml -LQUIP/src/fox/sax -Llammps/src -L/Users/jegorsbalzins/metal/md/build
 INCLUDE=-IQUIP/src/fox/wxml -IQUIP/src/fox/sax -Ilammps/src
-OBJ=lammps.o mt19937-64.o constants.o geometry.o atoms_types.o utils.o atoms.o ml.o kmc.o
+OBJ=lammps.o mt19937-64.o constants.o geometry.o atoms_types.o utils.o atoms.o ml.o swiftmd_mod.o kmc.o
 TARGETS=mlkmc train_ml remove_duplicates convert_to_FANN_format refit_ml make_descriptor merge_predictors analyze_system
 
 .SECONDARY:

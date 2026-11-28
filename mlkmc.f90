@@ -23,6 +23,8 @@ program mlkmc
   use potential_module
   use constants_module
   use ml_module
+  use swiftmd_module
+  use jgap_soap_module
   use kmc_module
   implicit none
 
@@ -57,7 +59,8 @@ program mlkmc
   double precision :: max_wall_time
   double precision :: soap_cutoff
   integer :: print_interval
-  character(len=80) :: xyz_out,pot_name,pot_style,predictor_file,restart_file
+  character(len=80) :: xyz_out,predictor_file,restart_file
+  character(len=256) :: pot_name,pot_style
   character(len=80) :: zstring,depstring
   logical :: exist,debug,restart_read,allow_exchange,periodic(3),hcp_flag,track_MSD
   integer :: i,error,internal_error,coord_jumping,coord_middle,coord_target,shell,ml_read,outfileunit
@@ -66,26 +69,80 @@ program mlkmc
   integer,allocatable :: atom_type(:)
   real(kind=rk),allocatable :: pos(:,:)
 
-  character(len=512) :: cmds
+  integer,parameter :: MAX_HYBRID_POTS=8
+  character(len=256) :: pot_files(MAX_HYBRID_POTS),style_tokens(MAX_HYBRID_POTS+4),elem_str
+  integer :: n_pot_files,n_style_tokens,k_pot
+  character(len=1024) :: cmds
   character(len=12),allocatable :: args(:)
   integer :: myrank,mpierror,ios
   double precision :: start_time
+  character(len=32) :: backend_mode
+  double precision :: swiftmd_active_region,swiftmd_ftol
+  integer :: swiftmd_gpu,swiftmd_climb
+  logical :: use_swiftmd,swiftmd_supported,mpi_is_init
+  character(len=256) :: swiftmd_pot_path,swiftmd_eam_path,env_val
+  integer :: env_len,env_stat
 
   error=0
   call read_input()
 
-  allocate(args(9))
-  args(1)="liblammps"
-  args(2)="-log"
-  args(3)="none"
-  args(4)="-screen"
-  args(5)="none"
-  args(6)="-partition"
-  args(7)=neb_images//"x1"
-  args(8)="-in"
-  args(9)="none"
+  call get_environment_variable("MLKMC_BACKEND",env_val,length=env_len,status=env_stat)
+  if (env_stat==0 .and. env_len>0) backend_mode=trim(adjustl(env_val))
 
-  lmp=lammps(args=args)
+  call get_environment_variable("MLKMC_SWIFTMD_ACTIVE_REGION",env_val,length=env_len,status=env_stat)
+  if (env_stat==0 .and. env_len>0) then
+    read(env_val,*,iostat=ios) swiftmd_active_region
+  endif
+
+  call get_environment_variable("MLKMC_SWIFTMD_GPU",env_val,length=env_len,status=env_stat)
+  if (env_stat==0 .and. env_len>0) then
+    read(env_val,*,iostat=ios) swiftmd_gpu
+  endif
+
+  call get_environment_variable("MLKMC_SWIFTMD_FTOL",env_val,length=env_len,status=env_stat)
+  if (env_stat==0 .and. env_len>0) then
+    read(env_val,*,iostat=ios) swiftmd_ftol
+  endif
+
+  call get_environment_variable("MLKMC_SWIFTMD_CLIMB",env_val,length=env_len,status=env_stat)
+  if (env_stat==0 .and. env_len>0) then
+    read(env_val,*,iostat=ios) swiftmd_climb
+  endif
+
+  call split_whitespace_tokens(pot_name,pot_files,n_pot_files)
+  swiftmd_supported=swiftmd_is_supported_potential(pot_style,pot_files,n_pot_files,&
+                                                   substrate_type,swiftmd_pot_path,swiftmd_eam_path)
+  if (trim(backend_mode)=="lammps") then
+    use_swiftmd=.false.
+  elseif (trim(backend_mode)=="swiftmd") then
+    if (.not. swiftmd_supported) then
+      write(0,"(a)") "*** Error: backend=swiftmd requested but pot_style/substrate_type is unsupported by SwiftMD"
+      stop
+    endif
+    use_swiftmd=.true.
+  else
+    use_swiftmd=swiftmd_supported
+  endif
+
+  if (use_swiftmd) then
+    call mpi_initialized(mpi_is_init,mpierror)
+    if (.not. mpi_is_init) then
+      call mpi_init(mpierror)
+    endif
+  else
+    allocate(args(9))
+    args(1)="liblammps"
+    args(2)="-log"
+    args(3)="none"
+    args(4)="-screen"
+    args(5)="none"
+    args(6)="-partition"
+    args(7)=neb_images//"x1"
+    args(8)="-in"
+    args(9)="none"
+
+    lmp=lammps(args=args)
+  endif
   start_time=mpi_wtime()
 
   call mpi_comm_rank(MPI_COMM_WORLD,myrank,mpierror)
@@ -95,10 +152,18 @@ program mlkmc
   call verbosity_push(PRINT_SILENT)
   
   if (myrank==0) then
-    inquire(file=pot_name,exist=exist)
-    if (.not. exist) then
-      write(0,"(a)") "*** Error: pot_name file "//trim(pot_name)//" doesn't exist"
+    call split_whitespace_tokens(pot_name,pot_files,n_pot_files)
+    if (n_pot_files<1) then
+      write(0,"(a)") "*** Error: pot_name is empty"
       error=1
+    else
+      do k_pot=1,n_pot_files
+        inquire(file=trim(pot_files(k_pot)),exist=exist)
+        if (.not. exist) then
+          write(0,"(a)") "*** Error: pot_name file "//trim(pot_files(k_pot))//" doesn't exist"
+          error=1
+        endif
+      end do
     endif
     if (error==0) then
       n_soap_Z=nZ
@@ -225,11 +290,25 @@ program mlkmc
   endif
   call mpi_bcast(error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpierror)
   if (error/=0) then
-    call lmp%close()
+    if (.not. use_swiftmd) call lmp%close()
     call mpi_finalize(mpierror)
     stop
   endif
-  if (myrank==0) then
+  if (.not. use_swiftmd) then
+    if (myrank==0) then
+    elem_str=""
+    do i=1,nZ
+      if (substrate_TYPE==SUBSTRATE_TYPE_WEAK) then
+        if (i==1) then
+          elem_str=trim(elem_str)//" "//trim(ElementName(Z(i)))//"1"
+        elseif (i==2) then
+          elem_str=trim(elem_str)//" "//trim(ElementName(Z(i)))//"2"
+        endif
+      else
+        elem_str=trim(elem_str)//" "//trim(ElementName(Z(i)))
+      endif
+    end do
+
     cmds="units metal"//new_line("a")//&
          "dimension 3"//new_line("a")//&
          "atom_style atomic"//new_line("a")//&
@@ -238,19 +317,25 @@ program mlkmc
          " 0 "//real(system%lattice(2,2),kind=dp)//&
          " 0 "//real(system%lattice(3,3),kind=dp)//new_line("a")//&
          "create_box "//nZ//" box"//new_line("a")//&
-         "pair_style "//pot_style//new_line("a")//&
-         "pair_coeff * * "//pot_name
-    do i=1,nZ
-      if (substrate_TYPE==SUBSTRATE_TYPE_WEAK) then
-        if (i==1) then
-          cmds=trim(cmds)//" "//trim(ElementName(Z(i)))//"1"
-        elseif (i==2) then
-          cmds=trim(cmds)//" "//trim(ElementName(Z(i)))//"2"
-        endif
+         "pair_style "//trim(pot_style)
+
+    call split_whitespace_tokens(pot_style,style_tokens,n_style_tokens)
+    call split_whitespace_tokens(pot_name,pot_files,n_pot_files)
+    if (n_style_tokens>=2 .and. (trim(style_tokens(1))=="hybrid/overlay" .or. trim(style_tokens(1))=="hybrid")) then
+      ! For hybrid / hybrid/overlay styles, pair each sub-style token with its corresponding pot_name file
+      if (n_style_tokens-1/=n_pot_files) then
+        write(0,"(a,i0,a,i0)") "*** Error: hybrid pot_style sub-style count (",n_style_tokens-1,&
+                               ") does not match pot_name file count (",n_pot_files,")"
+        error=1
       else
-        cmds=trim(cmds)//" "//ElementName(Z(i))
+        do k_pot=1,n_pot_files
+          cmds=trim(cmds)//new_line("a")//"pair_coeff * * "//trim(style_tokens(k_pot+1))//&
+               " "//trim(pot_files(k_pot))//trim(elem_str)
+        end do
       endif
-    end do
+    else
+      cmds=trim(cmds)//new_line("a")//"pair_coeff * * "//trim(pot_name)//trim(elem_str)
+    endif
   endif
   call mpi_bcast(error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpierror)
   if (error/=0) then
@@ -259,7 +344,7 @@ program mlkmc
     stop
   endif
 
-  call mpi_bcast(cmds,512,MPI_CHAR,0,MPI_COMM_WORLD,mpierror)
+  call mpi_bcast(cmds,len(cmds),MPI_CHAR,0,MPI_COMM_WORLD,mpierror)
   call lmp%commands_string(cmds)
 
   ! Add frozen atoms to the LAMMPS object, since they will never move
@@ -283,8 +368,9 @@ program mlkmc
                         type=atom_type,&
                         x=reshape(real(pos,kind=dp),[3*(last_id-first_id+1)]))
   deallocate(atom_type,pos)
-  call lmp%command("group frozen union all")
-  call lmp%command("fix freeze frozen setforce 0.0 0.0 0.0")
+    call lmp%command("group frozen union all")
+    call lmp%command("fix freeze frozen setforce 0.0 0.0 0.0")
+  endif
   
   if (myrank==0) then   
     if (restart_read) then
@@ -314,6 +400,50 @@ program mlkmc
       if (internal_error/=0) then
         write(0,"(a)") "*** Error initialising KMC"
         error=internal_error
+      endif
+    endif
+
+    if (error==0) then
+      call jgap_soap_init_ctx(kmc%jgap_soap,string(kmc%desc_str),&
+                              real(kmc%system%lattice,kind=dp),internal_error)
+      if (internal_error/=0) then
+        write(0,"(a)") "*** Warning: JGAP SOAP init failed, falling back to QUIP SOAP"
+      elseif (verbosity>=VERBOSITY_QUIET) then
+        if (kmc%jgap_soap%enabled) then
+          if (kmc%jgap_soap%verify) then
+            write(6,"(a,i0,a)") "# SOAP backend: JGAP VERIFY vs QUIP (dim=",kmc%jgap_soap%dim,")"
+          else
+            write(6,"(a,i0,a)") "# SOAP backend: JGAP (dim=",kmc%jgap_soap%dim,")"
+          endif
+        else
+          write(6,"(a)") "# SOAP backend: QUIP"
+        endif
+      endif
+    endif
+
+    if (use_swiftmd .and. error==0) then
+      kmc%swiftmd%ftol_override=swiftmd_ftol
+      kmc%swiftmd%climb=swiftmd_climb
+      call get_environment_variable("MLKMC_NEB_REJECT_FMAX",env_val,length=env_len,status=env_stat)
+      if (env_stat==0 .and. env_len>0) then
+        read(env_val,*,iostat=ios) kmc%neb_reject_fmax
+      endif
+      write(6,"(a,es10.3,a)") "# Unconverged SwiftMD NEBs (fmax > ",kmc%neb_reject_fmax,&
+        " eV/A) are kept out of ML training (<=0: disabled)"
+      call get_environment_variable("MLKMC_NEB_FORBID_FMAX",env_val,length=env_len,status=env_stat)
+      if (env_stat==0 .and. env_len>0) then
+        read(env_val,*,iostat=ios) kmc%neb_forbid_fmax
+      endif
+      write(6,"(a,es10.3,a)") "# Broken SwiftMD NEBs (conv=0, fmax > ",kmc%neb_forbid_fmax,&
+        " eV/A) are forbidden and cached (<=0: disabled)"
+      call swiftmd_init_ctx(kmc%swiftmd,swiftmd_pot_path,swiftmd_eam_path,&
+                            kmc%system,swiftmd_gpu,swiftmd_active_region,internal_error)
+      if (internal_error/=0) then
+        write(0,"(a)") "*** Error initialising SwiftMD engine"
+        error=internal_error
+      else if (verbosity>=VERBOSITY_QUIET) then
+        write(6,"(a,f6.2,a,i0,a,l1,a)") "# Backend: SwiftMD (active_region=",swiftmd_active_region,&
+                                        " A, gpu=",swiftmd_gpu,", neb_batch=",kmc%swiftmd%use_neb_batch,")"
       endif
     endif
 
@@ -388,7 +518,8 @@ program mlkmc
   endif
   call mpi_bcast(error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpierror)
   if (error/=0) then
-    call lmp%close()
+    if (myrank==0 .and. use_swiftmd) call swiftmd_destroy_ctx(kmc%swiftmd)
+    if (.not. use_swiftmd) call lmp%close()
     call mpi_finalize(mpierror)
     stop
   endif
@@ -398,8 +529,15 @@ program mlkmc
   endif
   min_height=max(min_height,0.0_rk)
   max_height=min(max_height,kmc%system%lattice(3,3))
-  call run_kmc(kmc,lmp,temp,dep_rate,max_steps,max_time,max_wall_time,min_height,max_height,&
-               start_time,outfileunit,print_interval,write_interval,myrank,error=error)
+  if (use_swiftmd) then
+    if (myrank==0) then
+      call run_kmc(kmc,lmp,temp,dep_rate,max_steps,max_time,max_wall_time,min_height,max_height,&
+                   start_time,outfileunit,print_interval,write_interval,myrank,error=error)
+    endif
+  else
+    call run_kmc(kmc,lmp,temp,dep_rate,max_steps,max_time,max_wall_time,min_height,max_height,&
+                 start_time,outfileunit,print_interval,write_interval,myrank,error=error)
+  endif
   if (myrank==0) then
     t2=mpi_wtime()
     kmc%kmc_run_time=t2-t1
@@ -446,17 +584,40 @@ program mlkmc
     write(6,"(a)") "#       Check cache:       "//print_time(kmc%event_cache_time)
     write(6,"(a)") "#     Depositing atoms:  "//print_time(kmc%deposit_atom_time)
     write(6,"(a)") "#     Writing to files:  "//print_time(kmc%write_time)
+    if (kmc%jgap_soap%enabled) then
+      if (kmc%jgap_soap%verify) then
+        write(6,"(a,i0,a,es12.4)") "# JGAP SOAP verify: evals=",kmc%jgap_soap%eval_count,&
+          " max_abs_diff=",kmc%jgap_soap%max_verify_diff
+      else
+        write(6,"(a,i0)") "# JGAP SOAP evals: ",kmc%jgap_soap%eval_count
+      endif
+    endif
+    if (use_swiftmd .and. kmc%swiftmd%use_neb_batch) then
+      if (kmc%swiftmd%neb_batch_calls>0) then
+        write(6,"(a,i0,a,i0,a,f6.2,a)") "# SwiftMD NEB batch: ",kmc%swiftmd%neb_batch_calls,&
+          " calls, ",kmc%swiftmd%neb_batch_bands," bands (avg ",&
+          real(kmc%swiftmd%neb_batch_bands,kind=dp)/real(kmc%swiftmd%neb_batch_calls,kind=dp)," bands/call)"
+      else
+        write(6,"(a)") "# SwiftMD NEB batch: 0 calls"
+      endif
+    endif
   endif
 
-  call lmp%close()
+  if (myrank==0) call jgap_soap_destroy_ctx(kmc%jgap_soap)
+  if (use_swiftmd) then
+    if (myrank==0) call swiftmd_destroy_ctx(kmc%swiftmd)
+  else
+    call lmp%close()
+  endif
   call mpi_finalize(mpierror)
 
 contains
 
   subroutine read_input()
-    integer :: i,c,ios,n_initial_atoms_commands
+    integer :: i,c,ios,n_initial_atoms_commands,kw_pos
     character(len=80) :: param_file,key,arg,initial_atoms_arg,periodic_args(3),termination_arg
-    character(len=200) :: line
+    character(len=256) :: full_arg
+    character(len=512) :: line
 
     ! Sensible defaults
     xmax=27
@@ -504,6 +665,11 @@ contains
     track_MSD=.false.
     allow_exchange=.true.
     hcp_flag=.false.
+    backend_mode="auto"
+    swiftmd_active_region=15.0d0
+    swiftmd_ftol=1.0d-5
+    swiftmd_gpu=0
+    swiftmd_climb=1
 
     ! Initial values for checking duplicates
     pot_name=""
@@ -879,13 +1045,31 @@ contains
             write(0,"(a,i0)") "*** Error: duplicate parameter pot_file on line ",i
             stop
           endif
-          pot_name=arg
+          ! Capture full remainder of line so hybrid styles can pass space-separated files
+          kw_pos=index(line,"pot_name")
+          full_arg=adjustl(line(kw_pos+8:))
+          if (index(full_arg,"#")>0) full_arg=full_arg(1:index(full_arg,"#")-1)
+          call strip_quotes(full_arg)
+          if (len_trim(full_arg)==0) then
+            write(0,"(a,i0)") "*** Error: empty pot_name on line ",i
+            stop
+          endif
+          pot_name=trim(full_arg)
         case("pot_style")
           if (pot_style/="") then
             write(0,"(a,i0)") "*** Error: duplicate parameter pot_style on line ",i
             stop
           endif
-          pot_style=arg
+          ! Capture full remainder of line (e.g. "hybrid/overlay tabgap eam/fs" or "tabgap sort on")
+          kw_pos=index(line,"pot_style")
+          full_arg=adjustl(line(kw_pos+9:))
+          if (index(full_arg,"#")>0) full_arg=full_arg(1:index(full_arg,"#")-1)
+          call strip_quotes(full_arg)
+          if (len_trim(full_arg)==0) then
+            write(0,"(a,i0)") "*** Error: empty pot_style on line ",i
+            stop
+          endif
+          pot_style=trim(full_arg)
         case("lattice_constant")
           if (lattice_constant>=0.0d0) then
             write(0,"(a,i0)") "*** Error: duplicate parameter lattice_constant on line ",i
@@ -1162,6 +1346,36 @@ contains
             write(0,"(a,i0)") "*** Error: lae_cutoff_nth>=0 can't be "//trim(arg)//" on line ",i
             stop
           endif
+       case("backend")
+          backend_mode=adjustl(arg)
+        case("swiftmd_active_region")
+          read(arg,*,iostat=ios) swiftmd_active_region
+          if (ios/=0) then
+            write(0,"(a,i0)") "*** Error: couldn't read swiftmd_active_region from file "//trim(param_file)//" line ",i
+            stop
+          endif
+        case("swiftmd_gpu")
+          if (any(arg(1:1)==["T","t","Y","y","1"])) then
+            swiftmd_gpu=1
+          elseif (any(arg(1:1)==["F","f","N","n","0"])) then
+            swiftmd_gpu=0
+          else
+            read(arg,*,iostat=ios) swiftmd_gpu
+          endif
+        case("swiftmd_ftol")
+          read(arg,*,iostat=ios) swiftmd_ftol
+          if (ios/=0) then
+            write(0,"(a,i0)") "*** Error: couldn't read swiftmd_ftol from file "//trim(param_file)//" line ",i
+            stop
+          endif
+        case("swiftmd_climb")
+          if (any(arg(1:1)==["T","t","Y","y","1"])) then
+            swiftmd_climb=1
+          elseif (any(arg(1:1)==["F","f","N","n","0"])) then
+            swiftmd_climb=0
+          else
+            read(arg,*,iostat=ios) swiftmd_climb
+          endif
        case("max_jump_nth")
           if (max_jump_nth>=0) then
             write(0,"(a,i0)") "*** Error: duplicate parameter max_jump_nth on line ",i
@@ -1434,5 +1648,59 @@ contains
         write(0,"(a)") "*** Unimplemented crystal orientation in print_orientation()"
     end select
   end function print_orientation
+
+  subroutine split_whitespace_tokens(str,tokens,n_tokens)
+    character(len=*),intent(in) :: str
+    character(len=*),intent(out) :: tokens(:)
+    integer,intent(out) :: n_tokens
+
+    integer :: pos,end_pos,n_len,max_tok
+    character(len=1) :: ch
+
+    n_tokens=0
+    tokens=""
+    n_len=len_trim(str)
+    max_tok=size(tokens)
+    pos=1
+    do while (pos<=n_len)
+      do while (pos<=n_len)
+        ch=str(pos:pos)
+        if (ch/=" " .and. ch/=char(9)) exit
+        pos=pos+1
+      end do
+      if (pos>n_len) exit
+      end_pos=pos
+      do while (end_pos<=n_len)
+        ch=str(end_pos:end_pos)
+        if (ch==" " .or. ch==char(9)) exit
+        end_pos=end_pos+1
+      end do
+      if (n_tokens<max_tok) then
+        n_tokens=n_tokens+1
+        tokens(n_tokens)=str(pos:end_pos-1)
+      else
+        exit
+      endif
+      pos=end_pos
+    end do
+  end subroutine split_whitespace_tokens
+
+  subroutine strip_quotes(str)
+    character(len=*),intent(inout) :: str
+
+    integer :: j,k,n_len
+    character(len=len(str)) :: cleaned
+
+    cleaned=""
+    k=0
+    n_len=len_trim(str)
+    do j=1,n_len
+      if (str(j:j)/='"' .and. str(j:j)/="'") then
+        k=k+1
+        cleaned(k:k)=str(j:j)
+      endif
+    end do
+    str=adjustl(cleaned)
+  end subroutine strip_quotes
 
 end program mlkmc

@@ -16,13 +16,35 @@
 ! along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 module kmc_module
+  use, intrinsic :: iso_c_binding, only : c_double, c_int
   use constants_module
   use mlkmc_atoms_module
   use liblammps
   use libAtoms_module
   use descriptors_module
   use ml_module
+  use swiftmd_module
+  use jgap_soap_module
   implicit none
+
+  type t_neb_batch_item
+    logical :: is_exchange=.false.
+    integer :: atom_idx=0
+    integer :: site_id=0,final_id=0,initial_id=0
+    integer :: nn_atom=0,jump_shell=0,shell=0
+    integer :: initial_site=0,final_site=0
+    integer :: only_substrate_jump=SUBSTRATE_NOT
+    integer :: coord_jumping_fwd=0,coord_target_fwd=0,coord_middle=0
+    integer :: coord_jumping_rev=0,coord_target_rev=0
+    double precision,allocatable :: desc_fwd(:),desc_rev(:)
+    double precision :: cov_fwd=1.0d0,cov_rev=1.0d0
+    logical :: fwd_data_exists=.false.,rev_data_exists=.false.
+    logical :: fwd_ml_full=.false.,rev_ml_full=.false.
+    integer :: jumping_atom_i=0,middle_atom_i=0
+    real(kind=rk) :: disp1(3)=0.0_rk,disp2(3)=0.0_rk
+    integer :: alias_of=0,submit_idx=0
+    logical :: alias_swap=.false.
+  end type t_neb_batch_item
 
   type t_kmc
     integer :: relax_iter,neb_images,neb_steps
@@ -32,6 +54,15 @@ module kmc_module
     integer :: minim_cache_results(MINIM_CACHE_SIZE)=MINIM_RESULT_UNINIT
     integer :: minim_cache_index=0
     integer :: neb_calculations=0,minimizations=0
+    ! SwiftMD NEB quality checks (consistent with Kimari et al., Sec. 2):
+    !  - last_neb_forbid: SwiftMD error, or the jumping atom relaxed back to its start
+    !    ("final state relaxes improperly") -> event forbidden, no ML data
+    !  - last_neb_untrainable: band not converged (fmax > neb_reject_fmax) -> barrier used in KMC,
+    !    but not added to the ML training set
+    ! Override the thresholds with MLKMC_NEB_REJECT_FMAX / MLKMC_NEB_FORBID_FMAX (eV/A; <=0 disables).
+    logical :: last_neb_forbid=.false.,last_neb_untrainable=.false.
+    double precision :: neb_reject_fmax=-1.0d0,neb_forbid_fmax=0.5d0
+    integer :: neb_forbidden=0,neb_untrainable=0
 
     integer :: verbosity
 
@@ -56,6 +87,7 @@ module kmc_module
     double precision :: delta,zeta,regularisation
     type(extendable_str) :: desc_str
     type(descriptor) :: desc
+    type(t_jgap_soap_ctx) :: jgap_soap
 
     integer :: step
     double precision :: time,total_rate
@@ -70,6 +102,8 @@ module kmc_module
     double precision :: rate_fingerprint_time,rate_cache_time,event_fingerprint_time,event_cache_time
     double precision :: minimize_time,neb_barrier_time
     double precision :: predict_time,fit_time,write_time
+
+    type(t_swiftmd_ctx) :: swiftmd
 
     logical :: initialised=.false.
   end type t_kmc
@@ -102,7 +136,9 @@ contains
     endif
     internal_error=0
     
-    call mpi_bcast(max_steps,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
+    if (.not. kmc%swiftmd%enabled) then
+      call mpi_bcast(max_steps,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
+    endif
 
     if (myrank==0) then
       ! Frozen substrate is one monolayer
@@ -121,10 +157,12 @@ contains
 
     endif
 
-    call mpi_bcast(first_step,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
+    if (.not. kmc%swiftmd%enabled) then
+      call mpi_bcast(first_step,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
+    endif
 
     if (myrank==0) then
-      wall_time_interval=max_wall_time/10.0d0
+      wall_time_interval=min(1800.0d0,max_wall_time/10.0d0)
       ! Always printed:
       call write_output_header(kmc)
       call write_output_line(kmc,error=write_error)
@@ -133,6 +171,7 @@ contains
       else
         t1=mpi_wtime()
         call print_xyz_frame(kmc%system,kmc%time,kmc%step,fileunit,debug=kmc%debug,error=internal_error)
+        flush(fileunit)
         t2=mpi_wtime()
         kmc%write_time=kmc%write_time+t2-t1
         if (internal_error/=0) then
@@ -141,7 +180,9 @@ contains
         dump_t1=mpi_wtime()
       endif
     endif
-    call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
+    if (.not. kmc%swiftmd%enabled) then
+      call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
+    endif
     if (internal_error/=0) then
       if (present(error)) then
         error=internal_error
@@ -151,7 +192,7 @@ contains
 
     ! Workers only participate in neb_barrier(); keep them parked on a single
     ! mpi_bcast instead of broadcasting 12+ per-step KMC flags when no NEB runs.
-    if (myrank/=0) then
+    if (myrank/=0 .and. .not. kmc%swiftmd%enabled) then
       do
         call mpi_bcast(worker_cmd,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
         if (worker_cmd==0) then
@@ -333,6 +374,7 @@ contains
           elapsed_time=0.0_rk
           t1=mpi_wtime()
           call print_xyz_frame(kmc%system,kmc%time,kmc%step,fileunit,debug=kmc%debug,error=internal_error)
+          flush(fileunit)
           if (internal_error/=0) then
             write(0,"(a)") "*** Error writing atoms xyz in run_kmc()"
           endif
@@ -374,9 +416,10 @@ contains
       if (internal_error==0 .and. .not. end_loop .and. max_wall_time>0) then
         t2=mpi_wtime()
         if (t2-dump_t1>wall_time_interval) then
-          write(6,"(a)",advance="no") "# Reached (another) tenth of maximum wall time, dumping intermediate data..."
+          write(6,"(a)",advance="no") "# Reached checkpoint interval, dumping intermediate data..."
           call dump_data_intermediate(kmc,error=internal_error)
           write(6,"(a)") " done"
+          flush(6)
           dump_t1=mpi_wtime()
         endif
         if (internal_error==0) then
@@ -397,9 +440,11 @@ contains
       endif
     end do
 
-    worker_cmd=0
-    call mpi_bcast(worker_cmd,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
-    call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
+    if (.not. kmc%swiftmd%enabled) then
+      worker_cmd=0
+      call mpi_bcast(worker_cmd,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
+      call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
+    endif
 
     if (internal_error/=0) then
       if (present(error)) then
@@ -413,7 +458,9 @@ contains
         t2=mpi_wtime()
         kmc%write_time=kmc%write_time+t2-t1
       endif
-      call mpi_barrier(mpi_comm_world,mpi_error)
+      if (.not. kmc%swiftmd%enabled) then
+        call mpi_barrier(mpi_comm_world,mpi_error)
+      endif
       return
     endif
 
@@ -430,7 +477,9 @@ contains
       t2=mpi_wtime()
       kmc%write_time=kmc%write_time+t2-t1
     endif
-    call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
+    if (.not. kmc%swiftmd%enabled) then
+      call mpi_bcast(internal_error,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
+    endif
     if (internal_error/=0) then
       if (present(error)) then
         error=internal_error
@@ -571,6 +620,11 @@ contains
 
     type(Atoms) :: lae
     type(descriptor_data) :: desc_forward,desc_reverse
+    real(c_double),allocatable,save :: jgap_pos_buf(:,:)
+    integer(c_int),allocatable,save :: jgap_z_buf(:)
+    double precision,allocatable,save :: desc_fwd_vec(:),desc_rev_vec(:),jgap_tmp_fwd(:),jgap_tmp_rev(:)
+    double precision :: cov_fwd,cov_rev,verify_diff
+    integer :: n_lae,desc_dim
     integer :: mpi_error
 
     if (present(error)) then
@@ -581,6 +635,14 @@ contains
     if (.not. kmc%initialised) then
       write(0,"(a)") "*** Error: kmc not initialised before get_rates()"
       internal_error=1
+      if (present(error)) then
+        error=internal_error
+      endif
+      return
+    endif
+
+    if (kmc%swiftmd%enabled .and. kmc%swiftmd%use_neb_batch .and. .not. kmc%swiftmd%save_neb) then
+      call get_rates_swiftmd_batch(kmc,lmp,myrank,error=internal_error)
       if (present(error)) then
         error=internal_error
       endif
@@ -738,32 +800,47 @@ contains
                     n_near_final>0) then
                   obstructed=.true.
                 endif
-                ! Check minimization cache for a hit before doing a new minimization
-                if (.not. obstructed) then
-                  t1=mpi_wtime()
-                  call create_fingerprint(kmc,site_id,final_id,fingerprint,error=internal_error)
-                  t2=mpi_wtime()
-                  kmc%rate_fingerprint_time=kmc%rate_fingerprint_time+t2-t1
-                  if (internal_error/=0) then
-                    write(0,"(a)") "*** Error getting fingerprint in get_rates()"
-                  endif
-                  if (internal_error==0) then
-                    t1=mpi_wtime()
-                    minim_result=check_minim_cache(kmc,fingerprint,error=internal_error)
-                    t2=mpi_wtime()
-                    kmc%rate_cache_time=kmc%rate_cache_time+t2-t1
-                    if (internal_error/=0) then
-                      write(0,"(a)") "*** Error checking minimization cache in get_rates()"
-                    endif
-                    if (minim_result==MINIM_RESULT_FAIL) then
-                      obstructed=.true.
-                      if (kmc%verbosity>=VERBOSITY_LOUD) then
-                        write(6,"(a)") "# Found a failed minimization in minim_cache"
-                      endif
-                    endif
+              endif
+            endif
+            only_substrate_jump=SUBSTRATE_NOT
+            if (.not. obstructed) then
+              if (kmc%system%crystal_structure==CRYSTAL_STRUCTURE_CLOSE_PACKED .and. &
+                  kmc%system%orientation==ORIENTATION_111) then
+                t1=mpi_wtime()
+                call only_substrate_lae(kmc,site_id,final_id,only_substrate_jump,error=internal_error)
+                t2=mpi_wtime()
+                kmc%lae_sub_time=kmc%lae_sub_time+t2-t1
+                if (internal_error/=0) then
+                  write(0,"(a)") "*** Error determining only-substrate lae case in get_rates()"
+                endif
+              endif
+            endif
+            if (.not. obstructed .and. only_substrate_jump==SUBSTRATE_NOT) then
+              ! Check minimization cache for a hit before doing a new minimization (never for bare-terrace hops)
+              t1=mpi_wtime()
+              call create_fingerprint(kmc,site_id,final_id,fingerprint,jump_shell=jump_shell,error=internal_error)
+              t2=mpi_wtime()
+              kmc%rate_fingerprint_time=kmc%rate_fingerprint_time+t2-t1
+              if (internal_error/=0) then
+                write(0,"(a)") "*** Error getting fingerprint in get_rates()"
+              endif
+              if (internal_error==0) then
+                t1=mpi_wtime()
+                minim_result=check_minim_cache(kmc,fingerprint,error=internal_error)
+                t2=mpi_wtime()
+                kmc%rate_cache_time=kmc%rate_cache_time+t2-t1
+                if (internal_error/=0) then
+                  write(0,"(a)") "*** Error checking minimization cache in get_rates()"
+                endif
+                if (minim_result==MINIM_RESULT_FAIL) then
+                  obstructed=.true.
+                  if (kmc%verbosity>=VERBOSITY_LOUD) then
+                    write(6,"(a)") "# Found a failed minimization in minim_cache"
                   endif
                 endif
               endif
+            else
+              minim_result=MINIM_RESULT_UNINIT
             endif
             if (internal_error/=0) then
               if (present(error)) then
@@ -773,29 +850,9 @@ contains
             endif
             if (.not. obstructed) then
               if (hop_event_states(nn_atom,jump_shell)==EVENT_LAE_CHANGED) then
-                only_substrate_jump=SUBSTRATE_NOT
-                if (kmc%system%crystal_structure==CRYSTAL_STRUCTURE_CLOSE_PACKED) then
-                  if (kmc%system%orientation==ORIENTATION_111) then
-                    t1=mpi_wtime()
-                    call only_substrate_lae(kmc,site_id,final_id,only_substrate_jump,error=internal_error)
-                    t2=mpi_wtime()
-                    kmc%lae_sub_time=kmc%lae_sub_time+t2-t1
-                  endif
-                endif
                 if (internal_error/=0) then
                   write(0,"(a)") "*** Error determining only-substrate lae case in get_rates()"
                 else
-                  if (only_substrate_jump==SUBSTRATE_NOT .or. kmc%substrate_fcc_hcp_barrier<0.0_rk &
-                                                         .or. kmc%substrate_hcp_fcc_barrier<0.0_rk) then
-                    t1=mpi_wtime()
-                    call get_jump_lae(kmc,site_id,final_id,jump_type=EVENT_TYPE_HOP,&
-                                      lae=lae,error=internal_error)
-                    t2=mpi_wtime()
-                    kmc%lae_time=kmc%lae_time+t2-t1
-                    if (internal_error/=0) then
-                      write(0,"(a)") "*** Error getting lae in get_rates()"
-                    endif
-                  endif
                   event_ok=.false.
                   if (only_substrate_jump==SUBSTRATE_FCC_HCP) then
                     if (kmc%substrate_fcc_hcp_barrier>=0.0_rk .and. kmc%substrate_hcp_fcc_barrier>=0.0_rk) then
@@ -812,44 +869,122 @@ contains
                   endif
                   nan_detected=.false.
                   if (.not. event_ok) then
-                    t1=mpi_wtime()
-                    call calc(kmc%desc,lae,desc_forward,do_descriptor=.true.,&
-                              args_str="atom_mask_name=jumping",error=internal_error)
-                    t2=mpi_wtime()
-                    kmc%desc_time=kmc%desc_time+t2-t1
-                    if (internal_error/=0) then
-                      write(0,"(a)") "*** Error: couldn't calculate forward descriptor in get_rates()"
-                      call write(lae,"lae_"//lae_index//"_1.xyz")
-                    else
-                      if (any(desc_forward%x(1)%data(:)/=desc_forward%x(1)%data(:))) then
-                        write(0,"(a,i0)") "*** Warning: NaN values in forward descriptor of LAE ",lae_index
-                        nan_detected=.true.
-                        call write(lae,"lae_"//lae_index//"_1.xyz")
+                    if (kmc%jgap_soap%enabled .and. .not. kmc%jgap_soap%verify) then
+                      desc_dim=kmc%jgap_soap%dim
+                      if (.not. allocated(desc_fwd_vec)) then
+                        allocate(desc_fwd_vec(desc_dim),desc_rev_vec(desc_dim))
+                      elseif (size(desc_fwd_vec)/=desc_dim) then
+                        deallocate(desc_fwd_vec,desc_rev_vec)
+                        allocate(desc_fwd_vec(desc_dim),desc_rev_vec(desc_dim))
                       endif
                       t1=mpi_wtime()
-                      lae%pos(:,1)=kmc%system%sites(final_id)%cartesian_coords(:)
-                      call calc_connect(lae)
+                      call get_jump_lae_buf(kmc,site_id,final_id,EVENT_TYPE_HOP,n_lae,jgap_pos_buf,jgap_z_buf)
                       t2=mpi_wtime()
                       kmc%lae_time=kmc%lae_time+t2-t1
-
                       t1=mpi_wtime()
-                      call calc(kmc%desc,lae,desc_reverse,do_descriptor=.true.,&
-                                args_str="atom_mask_name=jumping",error=internal_error)
-                      t2=mpi_wtime()
-                      kmc%desc_time=kmc%desc_time+t2-t1
-                      if (internal_error/=0) then
-                        write(0,"(a)") "*** Error: couldn't calculate reverse descriptor in get_rates()"
-                        call write(lae,"lae_"//lae_index//"_2.xyz")
-                      else
-                        if (any(desc_reverse%x(1)%data(:)/=desc_reverse%x(1)%data(:))) then
-                          write(0,"(a,i0)") "*** Warning: NaN values in reverse descriptor of LAE index ",lae_index
+                      call jgap_soap_eval_buf(kmc%jgap_soap,jgap_pos_buf,jgap_z_buf,n_lae,0,desc_fwd_vec,internal_error)
+                      if (internal_error==0) then
+                        if (any(desc_fwd_vec/=desc_fwd_vec)) then
+                          write(0,"(a,i0)") "*** Warning: NaN values in forward descriptor of LAE ",lae_index
                           nan_detected=.true.
-                          call write(lae,"lae_"//lae_index//"_2.xyz")
+                        else
+                          jgap_pos_buf(:,1)=real(kmc%system%sites(final_id)%cartesian_coords(:),c_double)
+                          call jgap_soap_eval_buf(kmc%jgap_soap,jgap_pos_buf,jgap_z_buf,n_lae,0,desc_rev_vec,internal_error)
+                          if (internal_error==0) then
+                            if (any(desc_rev_vec/=desc_rev_vec)) then
+                              write(0,"(a,i0)") "*** Warning: NaN values in reverse descriptor of LAE index ",lae_index
+                              nan_detected=.true.
+                            endif
+                          endif
                         endif
                       endif
+                      t2=mpi_wtime()
+                      kmc%desc_time=kmc%desc_time+t2-t1
+                      cov_fwd=1.0d0
+                      cov_rev=1.0d0
+                      lae_index=lae_index+1
+                    else
+                      t1=mpi_wtime()
+                      call get_jump_lae(kmc,site_id,final_id,jump_type=EVENT_TYPE_HOP,&
+                                        lae=lae,error=internal_error)
+                      t2=mpi_wtime()
+                      kmc%lae_time=kmc%lae_time+t2-t1
+                      if (internal_error/=0) then
+                        write(0,"(a)") "*** Error getting lae in get_rates()"
+                      else
+                        t1=mpi_wtime()
+                        call calc(kmc%desc,lae,desc_forward,do_descriptor=.true.,&
+                                  args_str="atom_mask_name=jumping",error=internal_error)
+                        t2=mpi_wtime()
+                        kmc%desc_time=kmc%desc_time+t2-t1
+                        if (internal_error/=0) then
+                          write(0,"(a)") "*** Error: couldn't calculate forward descriptor in get_rates()"
+                          call write(lae,"lae_"//lae_index//"_1.xyz")
+                        else
+                          if (any(desc_forward%x(1)%data(:)/=desc_forward%x(1)%data(:))) then
+                            write(0,"(a,i0)") "*** Warning: NaN values in forward descriptor of LAE ",lae_index
+                            nan_detected=.true.
+                            call write(lae,"lae_"//lae_index//"_1.xyz")
+                          endif
+                          t1=mpi_wtime()
+                          lae%pos(:,1)=kmc%system%sites(final_id)%cartesian_coords(:)
+                          call calc_connect_atom(lae,1,error=internal_error)
+                          t2=mpi_wtime()
+                          kmc%lae_time=kmc%lae_time+t2-t1
+
+                          t1=mpi_wtime()
+                          call calc(kmc%desc,lae,desc_reverse,do_descriptor=.true.,&
+                                    args_str="atom_mask_name=jumping",error=internal_error)
+                          t2=mpi_wtime()
+                          kmc%desc_time=kmc%desc_time+t2-t1
+                          if (internal_error/=0) then
+                            write(0,"(a)") "*** Error: couldn't calculate reverse descriptor in get_rates()"
+                            call write(lae,"lae_"//lae_index//"_2.xyz")
+                          else
+                            if (any(desc_reverse%x(1)%data(:)/=desc_reverse%x(1)%data(:))) then
+                              write(0,"(a,i0)") "*** Warning: NaN values in reverse descriptor of LAE index ",lae_index
+                              nan_detected=.true.
+                              call write(lae,"lae_"//lae_index//"_2.xyz")
+                            endif
+                          endif
+                        endif
+                        call finalise(lae)
+                        if (internal_error==0) then
+                          desc_dim=size(desc_forward%x(1)%data)
+                          if (.not. allocated(desc_fwd_vec)) then
+                            allocate(desc_fwd_vec(desc_dim),desc_rev_vec(desc_dim))
+                          elseif (size(desc_fwd_vec)/=desc_dim) then
+                            deallocate(desc_fwd_vec,desc_rev_vec)
+                            allocate(desc_fwd_vec(desc_dim),desc_rev_vec(desc_dim))
+                          endif
+                          desc_fwd_vec=desc_forward%x(1)%data(:)
+                          desc_rev_vec=desc_reverse%x(1)%data(:)
+                          cov_fwd=desc_forward%x(1)%covariance_cutoff
+                          cov_rev=desc_reverse%x(1)%covariance_cutoff
+                          if (kmc%jgap_soap%enabled .and. kmc%jgap_soap%verify .and. .not. nan_detected) then
+                            if (.not. allocated(jgap_tmp_fwd)) then
+                              allocate(jgap_tmp_fwd(kmc%jgap_soap%dim),jgap_tmp_rev(kmc%jgap_soap%dim))
+                            endif
+                            call get_jump_lae_buf(kmc,site_id,final_id,EVENT_TYPE_HOP,n_lae,jgap_pos_buf,jgap_z_buf)
+                            call jgap_soap_eval_buf(kmc%jgap_soap,jgap_pos_buf,jgap_z_buf,n_lae,0,jgap_tmp_fwd,internal_error)
+                            jgap_pos_buf(:,1)=real(kmc%system%sites(final_id)%cartesian_coords(:),c_double)
+                            if (internal_error==0) then
+                              call jgap_soap_eval_buf(kmc%jgap_soap,jgap_pos_buf,jgap_z_buf,n_lae,0,jgap_tmp_rev,internal_error)
+                            endif
+                            if (internal_error==0) then
+                              verify_diff=max(maxval(abs(jgap_tmp_fwd-desc_fwd_vec)),maxval(abs(jgap_tmp_rev-desc_rev_vec)))
+                              if (verify_diff>kmc%jgap_soap%max_verify_diff) kmc%jgap_soap%max_verify_diff=verify_diff
+                              if (verify_diff>1.0d-12) then
+                                write(0,"(a,es12.4)") "*** Warning: JGAP vs QUIP hop SOAP diff = ",verify_diff
+                              endif
+                            endif
+                          endif
+                          call finalise(desc_forward)
+                          call finalise(desc_reverse)
+                        endif
+                      endif
+                      lae_index=lae_index+1
                     endif
-                    call finalise(lae)
-                    lae_index=lae_index+1
                   endif
                 endif
                 if (internal_error/=0) then
@@ -864,10 +999,9 @@ contains
                     initial_config=get_atoms(kmc%system)
                   endif
                   call get_barrier(kmc,lmp,site_id,final_id,nn_final,fingerprint,minim_result,&
-                                   desc_forward,desc_reverse,initial_config,&
-                                   barrier,reverse_barrier,event_ok,myrank,shell=shell,error=internal_error)
-                  call finalise(desc_forward)
-                  call finalise(desc_reverse)
+                                   desc_fwd_vec,desc_rev_vec,cov_fwd,cov_rev,initial_config,&
+                                   barrier,reverse_barrier,event_ok,myrank,shell=shell,&
+                                   cache_minim=(only_substrate_jump==SUBSTRATE_NOT),error=internal_error)
                   t2=mpi_wtime()
                   kmc%get_barrier_time=kmc%get_barrier_time+t2-t1
                   if (internal_error/=0) then
@@ -1097,77 +1231,146 @@ contains
           endif
           if (.not. obstructed) then
             if (exchange_event_states(final_site,initial_site)==EVENT_LAE_CHANGED) then
-              t1=mpi_wtime()
-              call get_jump_lae(kmc,site_id,final_id,jump_type=EVENT_TYPE_EXCHANGE,&
-                                lae=lae,jumping_ptr=jumping_ptr,&
-                                initial_id=initial_id,&
-                                error=internal_error)
-              t2=mpi_wtime()
-              kmc%lae_time=kmc%lae_time+t2-t1
-              if (internal_error/=0) then
-                write(0,"(a)") "*** Error getting lae in get_rates()"
-                if (present(error)) then
-                  error=internal_error
-                endif
-              endif
               nan_detected=.false.
-              t1=mpi_wtime()
-              call calc(kmc%desc,lae,desc_forward,do_descriptor=.true.,&
-                        args_str="atom_mask_name=jumping",error=internal_error)
-              t2=mpi_wtime()
-              kmc%desc_time=kmc%desc_time+t2-t1
-              if (internal_error/=0) then
-                write(0,"(a)") "*** Error: couldn't calculate forward descriptor in get_rates()"
-                if (present(error)) then
-                  error=internal_error
-                endif
-              else
-                if (any(desc_forward%x(1)%data(:)/=desc_forward%x(1)%data(:))) then
-                  write(0,"(a,i0)") "*** Warning: NaN values in forward descriptor of LAE index ",lae_index
-                  call write(lae,"lae_"//lae_index//"_1.xyz")
-                  nan_detected=.true.
+              if (kmc%jgap_soap%enabled .and. .not. kmc%jgap_soap%verify) then
+                desc_dim=kmc%jgap_soap%dim
+                if (.not. allocated(desc_fwd_vec)) then
+                  allocate(desc_fwd_vec(desc_dim),desc_rev_vec(desc_dim))
+                elseif (size(desc_fwd_vec)/=desc_dim) then
+                  deallocate(desc_fwd_vec,desc_rev_vec)
+                  allocate(desc_fwd_vec(desc_dim),desc_rev_vec(desc_dim))
                 endif
                 t1=mpi_wtime()
-                lae%pos(:,1)=kmc%system%sites(site_id)%cartesian_coords(:)
-                lae%pos(:,2)=kmc%system%sites(final_id)%cartesian_coords(:)
-                jumping_ptr(1)=.false.
-                jumping_ptr(2)=.true.
-                call calc_connect(lae)
+                call get_jump_lae_buf(kmc,site_id,final_id,EVENT_TYPE_EXCHANGE,n_lae,jgap_pos_buf,jgap_z_buf,initial_id=initial_id)
                 t2=mpi_wtime()
                 kmc%lae_time=kmc%lae_time+t2-t1
-
                 t1=mpi_wtime()
-                call calc(kmc%desc,lae,desc_reverse,do_descriptor=.true.,args_str="atom_mask_name=jumping",error=internal_error)
+                call jgap_soap_eval_buf(kmc%jgap_soap,jgap_pos_buf,jgap_z_buf,n_lae,0,desc_fwd_vec,internal_error)
+                if (internal_error==0) then
+                  if (any(desc_fwd_vec/=desc_fwd_vec)) then
+                    write(0,"(a,i0)") "*** Warning: NaN values in forward descriptor of LAE index ",lae_index
+                    nan_detected=.true.
+                  else
+                    jgap_pos_buf(:,1)=real(kmc%system%sites(site_id)%cartesian_coords(:),c_double)
+                    jgap_pos_buf(:,2)=real(kmc%system%sites(final_id)%cartesian_coords(:),c_double)
+                    call jgap_soap_eval_buf(kmc%jgap_soap,jgap_pos_buf,jgap_z_buf,n_lae,1,desc_rev_vec,internal_error)
+                    if (internal_error==0) then
+                      if (any(desc_rev_vec/=desc_rev_vec)) then
+                        write(0,"(a,i0)") "*** Warning: NaN values in reverse descriptor of LAE index ",lae_index
+                        nan_detected=.true.
+                      endif
+                    endif
+                  endif
+                endif
+                t2=mpi_wtime()
+                kmc%desc_time=kmc%desc_time+t2-t1
+                cov_fwd=1.0d0
+                cov_rev=1.0d0
+                lae_index=lae_index+1
+              else
+                t1=mpi_wtime()
+                call get_jump_lae(kmc,site_id,final_id,jump_type=EVENT_TYPE_EXCHANGE,&
+                                  lae=lae,jumping_ptr=jumping_ptr,&
+                                  initial_id=initial_id,&
+                                  error=internal_error)
+                t2=mpi_wtime()
+                kmc%lae_time=kmc%lae_time+t2-t1
+                if (internal_error/=0) then
+                  write(0,"(a)") "*** Error getting lae in get_rates()"
+                  if (present(error)) then
+                    error=internal_error
+                  endif
+                endif
+                t1=mpi_wtime()
+                call calc(kmc%desc,lae,desc_forward,do_descriptor=.true.,&
+                          args_str="atom_mask_name=jumping",error=internal_error)
                 t2=mpi_wtime()
                 kmc%desc_time=kmc%desc_time+t2-t1
                 if (internal_error/=0) then
-                  write(0,"(a)") "*** Error: couldn't calculate reverse descriptor in get_rates()"
+                  write(0,"(a)") "*** Error: couldn't calculate forward descriptor in get_rates()"
                   if (present(error)) then
                     error=internal_error
                   endif
                 else
-                  if (any(desc_reverse%x(1)%data(:)/=desc_reverse%x(1)%data(:))) then
-                    write(0,"(a,i0)") "*** Warning: NaN values in reverse descriptor of LAE index ",lae_index
-                    call write(lae,"lae_"//lae_index//"_2.xyz")
+                  if (any(desc_forward%x(1)%data(:)/=desc_forward%x(1)%data(:))) then
+                    write(0,"(a,i0)") "*** Warning: NaN values in forward descriptor of LAE index ",lae_index
+                    call write(lae,"lae_"//lae_index//"_1.xyz")
                     nan_detected=.true.
                   endif
+                  t1=mpi_wtime()
+                  lae%pos(:,1)=kmc%system%sites(site_id)%cartesian_coords(:)
+                  lae%pos(:,2)=kmc%system%sites(final_id)%cartesian_coords(:)
+                  jumping_ptr(1)=.false.
+                  jumping_ptr(2)=.true.
+                  call calc_connect_atom(lae,2,error=internal_error)
+                  t2=mpi_wtime()
+                  kmc%lae_time=kmc%lae_time+t2-t1
+
+                  t1=mpi_wtime()
+                  call calc(kmc%desc,lae,desc_reverse,do_descriptor=.true.,args_str="atom_mask_name=jumping",error=internal_error)
+                  t2=mpi_wtime()
+                  kmc%desc_time=kmc%desc_time+t2-t1
+                  if (internal_error/=0) then
+                    write(0,"(a)") "*** Error: couldn't calculate reverse descriptor in get_rates()"
+                    if (present(error)) then
+                      error=internal_error
+                    endif
+                  else
+                    if (any(desc_reverse%x(1)%data(:)/=desc_reverse%x(1)%data(:))) then
+                      write(0,"(a,i0)") "*** Warning: NaN values in reverse descriptor of LAE index ",lae_index
+                      call write(lae,"lae_"//lae_index//"_2.xyz")
+                      nan_detected=.true.
+                    endif
+                  endif
                 endif
+                call finalise(lae)
+                nullify(jumping_ptr)
+                if (internal_error==0) then
+                  desc_dim=size(desc_forward%x(1)%data)
+                  if (.not. allocated(desc_fwd_vec)) then
+                    allocate(desc_fwd_vec(desc_dim),desc_rev_vec(desc_dim))
+                  elseif (size(desc_fwd_vec)/=desc_dim) then
+                    deallocate(desc_fwd_vec,desc_rev_vec)
+                    allocate(desc_fwd_vec(desc_dim),desc_rev_vec(desc_dim))
+                  endif
+                  desc_fwd_vec=desc_forward%x(1)%data(:)
+                  desc_rev_vec=desc_reverse%x(1)%data(:)
+                  cov_fwd=desc_forward%x(1)%covariance_cutoff
+                  cov_rev=desc_reverse%x(1)%covariance_cutoff
+                  if (kmc%jgap_soap%enabled .and. kmc%jgap_soap%verify .and. .not. nan_detected) then
+                    if (.not. allocated(jgap_tmp_fwd)) then
+                      allocate(jgap_tmp_fwd(kmc%jgap_soap%dim),jgap_tmp_rev(kmc%jgap_soap%dim))
+                    endif
+                    call get_jump_lae_buf(kmc,site_id,final_id,EVENT_TYPE_EXCHANGE,n_lae,jgap_pos_buf,jgap_z_buf,initial_id=initial_id)
+                    call jgap_soap_eval_buf(kmc%jgap_soap,jgap_pos_buf,jgap_z_buf,n_lae,0,jgap_tmp_fwd,internal_error)
+                    jgap_pos_buf(:,1)=real(kmc%system%sites(site_id)%cartesian_coords(:),c_double)
+                    jgap_pos_buf(:,2)=real(kmc%system%sites(final_id)%cartesian_coords(:),c_double)
+                    if (internal_error==0) then
+                      call jgap_soap_eval_buf(kmc%jgap_soap,jgap_pos_buf,jgap_z_buf,n_lae,1,jgap_tmp_rev,internal_error)
+                    endif
+                    if (internal_error==0) then
+                      verify_diff=max(maxval(abs(jgap_tmp_fwd-desc_fwd_vec)),maxval(abs(jgap_tmp_rev-desc_rev_vec)))
+                      if (verify_diff>kmc%jgap_soap%max_verify_diff) kmc%jgap_soap%max_verify_diff=verify_diff
+                      if (verify_diff>1.0d-12) then
+                        write(0,"(a,es12.4)") "*** Warning: JGAP vs QUIP exchange SOAP diff = ",verify_diff
+                      endif
+                    endif
+                  endif
+                  call finalise(desc_forward)
+                  call finalise(desc_reverse)
+                endif
+                lae_index=lae_index+1
               endif
-              call finalise(lae)
-              nullify(jumping_ptr)
-              lae_index=lae_index+1
-              if (.not. nan_detected) then
+              if (.not. nan_detected .and. internal_error==0) then
                 t1=mpi_wtime()
                 if (.not. initial_config%initialised) then
                   initial_config=get_atoms(kmc%system)
                 endif
                 call get_barrier(kmc,lmp,site_id,final_id,nn_final,fingerprint,minim_result,&
-                                 desc_forward,desc_reverse,initial_config,&
+                                 desc_fwd_vec,desc_rev_vec,cov_fwd,cov_rev,initial_config,&
                                  barrier,reverse_barrier,event_ok,myrank,&
                                  initial_id=initial_id,&
                                  error=internal_error)
-                call finalise(desc_forward)
-                call finalise(desc_reverse)
                 t2=mpi_wtime()
                 kmc%get_barrier_time=kmc%get_barrier_time+t2-t1
                 if (internal_error/=0) then
@@ -1293,21 +1496,1257 @@ contains
 
   end subroutine get_rates
 
+  logical function is_atom_blocked(blocked_mat,n_blocked_arr,atom_idx,site_id)
+    integer,intent(in) :: blocked_mat(:,:),n_blocked_arr(:),atom_idx,site_id
+    integer :: j
+
+    is_atom_blocked=.false.
+    do j=1,n_blocked_arr(atom_idx)
+      if (blocked_mat(j,atom_idx)==site_id) then
+        is_atom_blocked=.true.
+        return
+      endif
+    end do
+  end function is_atom_blocked
+
+  subroutine mark_atom_blocked(blocked_mat,n_blocked_arr,atom_idx,site_id)
+    integer,allocatable,intent(inout) :: blocked_mat(:,:)
+    integer,intent(inout) :: n_blocked_arr(:)
+    integer,intent(in) :: atom_idx,site_id
+    integer :: old_cap,new_cap,ncols
+    integer,allocatable :: tmp(:,:)
+
+    if (is_atom_blocked(blocked_mat,n_blocked_arr,atom_idx,site_id)) return
+    if (n_blocked_arr(atom_idx)>=size(blocked_mat,1)) then
+      old_cap=size(blocked_mat,1)
+      new_cap=old_cap*2
+      ncols=size(blocked_mat,2)
+      allocate(tmp(new_cap,ncols))
+      tmp(1:old_cap,:)=blocked_mat(:,:)
+      call move_alloc(tmp,blocked_mat)
+    endif
+    n_blocked_arr(atom_idx)=n_blocked_arr(atom_idx)+1
+    blocked_mat(n_blocked_arr(atom_idx),atom_idx)=site_id
+  end subroutine mark_atom_blocked
+
+  subroutine batch_eval_soap(kmc,site_id,final_id,event_type,desc_fwd_vec,desc_rev_vec,&
+                             cov_fwd,cov_rev,nan_detected,lae_index,error,initial_id)
+    type(t_kmc),intent(inout) :: kmc
+    integer,intent(in) :: site_id,final_id,event_type
+    integer,optional,intent(in) :: initial_id
+    double precision,allocatable,intent(inout) :: desc_fwd_vec(:),desc_rev_vec(:)
+    double precision,intent(out) :: cov_fwd,cov_rev
+    logical,intent(out) :: nan_detected
+    integer,intent(inout) :: lae_index
+    integer,intent(out) :: error
+
+    double precision :: t1,t2,verify_diff
+    integer :: n_lae,desc_dim
+    type(Atoms) :: lae
+    type(descriptor_data) :: desc_forward,desc_reverse
+    logical,pointer :: jumping_ptr(:)
+    real(c_double),allocatable,save :: jgap_pos_buf(:,:),jgap_tmp_fwd(:),jgap_tmp_rev(:)
+    integer(c_int),allocatable,save :: jgap_z_buf(:)
+
+    error=0
+    nan_detected=.false.
+    cov_fwd=1.0d0
+    cov_rev=1.0d0
+
+    if (kmc%jgap_soap%enabled .and. .not. kmc%jgap_soap%verify) then
+      desc_dim=kmc%jgap_soap%dim
+      if (.not. allocated(desc_fwd_vec)) then
+        allocate(desc_fwd_vec(desc_dim),desc_rev_vec(desc_dim))
+      elseif (size(desc_fwd_vec)/=desc_dim) then
+        deallocate(desc_fwd_vec,desc_rev_vec)
+        allocate(desc_fwd_vec(desc_dim),desc_rev_vec(desc_dim))
+      endif
+      t1=mpi_wtime()
+      if (present(initial_id)) then
+        call get_jump_lae_buf(kmc,site_id,final_id,event_type,n_lae,jgap_pos_buf,jgap_z_buf,initial_id=initial_id)
+      else
+        call get_jump_lae_buf(kmc,site_id,final_id,event_type,n_lae,jgap_pos_buf,jgap_z_buf)
+      endif
+      t2=mpi_wtime()
+      kmc%lae_time=kmc%lae_time+t2-t1
+      t1=mpi_wtime()
+      call jgap_soap_eval_buf(kmc%jgap_soap,jgap_pos_buf,jgap_z_buf,n_lae,0,desc_fwd_vec,error)
+      if (error==0) then
+        if (any(desc_fwd_vec/=desc_fwd_vec)) then
+          write(0,"(a,i0)") "*** Warning: NaN values in forward descriptor of LAE ",lae_index
+          nan_detected=.true.
+        else
+          if (present(initial_id)) then
+            jgap_pos_buf(:,1)=real(kmc%system%sites(site_id)%cartesian_coords(:),c_double)
+            jgap_pos_buf(:,2)=real(kmc%system%sites(final_id)%cartesian_coords(:),c_double)
+            call jgap_soap_eval_buf(kmc%jgap_soap,jgap_pos_buf,jgap_z_buf,n_lae,1,desc_rev_vec,error)
+          else
+            jgap_pos_buf(:,1)=real(kmc%system%sites(final_id)%cartesian_coords(:),c_double)
+            call jgap_soap_eval_buf(kmc%jgap_soap,jgap_pos_buf,jgap_z_buf,n_lae,0,desc_rev_vec,error)
+          endif
+          if (error==0 .and. any(desc_rev_vec/=desc_rev_vec)) then
+            write(0,"(a,i0)") "*** Warning: NaN values in reverse descriptor of LAE index ",lae_index
+            nan_detected=.true.
+          endif
+        endif
+      endif
+      t2=mpi_wtime()
+      kmc%desc_time=kmc%desc_time+t2-t1
+      lae_index=lae_index+1
+      return
+    endif
+
+    t1=mpi_wtime()
+    if (present(initial_id)) then
+      call get_jump_lae(kmc,site_id,final_id,jump_type=event_type,lae=lae,jumping_ptr=jumping_ptr,&
+                        initial_id=initial_id,error=error)
+    else
+      call get_jump_lae(kmc,site_id,final_id,jump_type=event_type,lae=lae,error=error)
+    endif
+    t2=mpi_wtime()
+    kmc%lae_time=kmc%lae_time+t2-t1
+    if (error/=0) then
+      write(0,"(a)") "*** Error getting lae in get_rates_swiftmd_batch()"
+      return
+    endif
+
+    t1=mpi_wtime()
+    call calc(kmc%desc,lae,desc_forward,do_descriptor=.true.,args_str="atom_mask_name=jumping",error=error)
+    t2=mpi_wtime()
+    kmc%desc_time=kmc%desc_time+t2-t1
+    if (error/=0) then
+      write(0,"(a)") "*** Error: couldn't calculate forward descriptor in get_rates_swiftmd_batch()"
+      call finalise(lae)
+      return
+    endif
+    if (any(desc_forward%x(1)%data(:)/=desc_forward%x(1)%data(:))) then
+      write(0,"(a,i0)") "*** Warning: NaN values in forward descriptor of LAE ",lae_index
+      nan_detected=.true.
+    else
+      t1=mpi_wtime()
+      if (present(initial_id)) then
+        lae%pos(:,1)=kmc%system%sites(site_id)%cartesian_coords(:)
+        lae%pos(:,2)=kmc%system%sites(final_id)%cartesian_coords(:)
+        jumping_ptr(1)=.false.
+        jumping_ptr(2)=.true.
+        call calc_connect_atom(lae,2,error=error)
+      else
+        lae%pos(:,1)=kmc%system%sites(final_id)%cartesian_coords(:)
+        call calc_connect_atom(lae,1,error=error)
+      endif
+      t2=mpi_wtime()
+      kmc%lae_time=kmc%lae_time+t2-t1
+      t1=mpi_wtime()
+      call calc(kmc%desc,lae,desc_reverse,do_descriptor=.true.,args_str="atom_mask_name=jumping",error=error)
+      t2=mpi_wtime()
+      kmc%desc_time=kmc%desc_time+t2-t1
+      if (error/=0) then
+        write(0,"(a)") "*** Error: couldn't calculate reverse descriptor in get_rates_swiftmd_batch()"
+      elseif (any(desc_reverse%x(1)%data(:)/=desc_reverse%x(1)%data(:))) then
+        write(0,"(a,i0)") "*** Warning: NaN values in reverse descriptor of LAE index ",lae_index
+        nan_detected=.true.
+      endif
+    endif
+    if (error==0 .and. .not. nan_detected) then
+      desc_dim=size(desc_forward%x(1)%data)
+      if (.not. allocated(desc_fwd_vec)) then
+        allocate(desc_fwd_vec(desc_dim),desc_rev_vec(desc_dim))
+      elseif (size(desc_fwd_vec)/=desc_dim) then
+        deallocate(desc_fwd_vec,desc_rev_vec)
+        allocate(desc_fwd_vec(desc_dim),desc_rev_vec(desc_dim))
+      endif
+      desc_fwd_vec=desc_forward%x(1)%data(:)
+      desc_rev_vec=desc_reverse%x(1)%data(:)
+      cov_fwd=desc_forward%x(1)%covariance_cutoff
+      cov_rev=desc_reverse%x(1)%covariance_cutoff
+      if (kmc%jgap_soap%enabled .and. kmc%jgap_soap%verify) then
+        if (.not. allocated(jgap_tmp_fwd)) allocate(jgap_tmp_fwd(kmc%jgap_soap%dim),jgap_tmp_rev(kmc%jgap_soap%dim))
+        if (present(initial_id)) then
+          call get_jump_lae_buf(kmc,site_id,final_id,event_type,n_lae,jgap_pos_buf,jgap_z_buf,initial_id=initial_id)
+          call jgap_soap_eval_buf(kmc%jgap_soap,jgap_pos_buf,jgap_z_buf,n_lae,0,jgap_tmp_fwd,error)
+          jgap_pos_buf(:,1)=real(kmc%system%sites(site_id)%cartesian_coords(:),c_double)
+          jgap_pos_buf(:,2)=real(kmc%system%sites(final_id)%cartesian_coords(:),c_double)
+          if (error==0) call jgap_soap_eval_buf(kmc%jgap_soap,jgap_pos_buf,jgap_z_buf,n_lae,1,jgap_tmp_rev,error)
+        else
+          call get_jump_lae_buf(kmc,site_id,final_id,event_type,n_lae,jgap_pos_buf,jgap_z_buf)
+          call jgap_soap_eval_buf(kmc%jgap_soap,jgap_pos_buf,jgap_z_buf,n_lae,0,jgap_tmp_fwd,error)
+          jgap_pos_buf(:,1)=real(kmc%system%sites(final_id)%cartesian_coords(:),c_double)
+          if (error==0) call jgap_soap_eval_buf(kmc%jgap_soap,jgap_pos_buf,jgap_z_buf,n_lae,0,jgap_tmp_rev,error)
+        endif
+        if (error==0) then
+          verify_diff=max(maxval(abs(jgap_tmp_fwd-desc_fwd_vec)),maxval(abs(jgap_tmp_rev-desc_rev_vec)))
+          if (verify_diff>kmc%jgap_soap%max_verify_diff) kmc%jgap_soap%max_verify_diff=verify_diff
+        endif
+      endif
+    endif
+    call finalise(lae)
+    call finalise(desc_forward)
+    call finalise(desc_reverse)
+    lae_index=lae_index+1
+  end subroutine batch_eval_soap
+
+  subroutine prepare_barrier_or_queue(kmc,atom_idx,site_id,final_id,nn_final_val,fingerprint,minim_result,&
+                                      desc_fwd,desc_rev,cov_fwd,cov_rev,init,only_substrate_jump,&
+                                      nn_atom,jump_shell,shell,initial_site,final_site,initial_id,&
+                                      resolved,forward_barrier,reverse_barrier,event_ok,&
+                                      pending,n_pending,n_submit,sub_fcc_hcp_item,sub_hcp_fcc_item,error)
+    type(t_kmc),intent(inout) :: kmc
+    integer,intent(in) :: atom_idx,site_id,final_id,nn_final_val,fingerprint(kmc%nZ,0:NN_SHELLS),minim_result
+    double precision,intent(in) :: desc_fwd(:),desc_rev(:),cov_fwd,cov_rev
+    type(t_atoms),intent(inout) :: init
+    integer,intent(in) :: only_substrate_jump,nn_atom,jump_shell,shell,initial_site,final_site
+    integer,optional,intent(in) :: initial_id
+    logical,intent(out) :: resolved,event_ok
+    real(kind=rk),intent(out) :: forward_barrier,reverse_barrier
+    type(t_neb_batch_item),allocatable,intent(inout) :: pending(:)
+    integer,intent(inout) :: n_pending,n_submit,sub_fcc_hcp_item,sub_hcp_fcc_item
+    integer,intent(out) :: error
+
+    logical :: is_exch,ml_fwd_called,ml_rev_called,fwd_exists,rev_exists,fwd_full,rev_full,final_relaxed,in_chk
+    integer :: cf,tf,cm,cr,tr,js,i,m,n_chk,chk(25),nn_sh,nn_a,nn_id,id,old_cap
+    double precision :: ml_tol2,zero_tol,ml_fwd_b,ml_rev_b,fwd_var,rev_var,neb_fwd_b,neb_rev_b,ftol,t1,t2
+    real(kind=rk) :: disp2
+    type(t_atoms) :: final_cfg,final_cfg_rel
+    type(t_neb_batch_item) :: item
+    type(t_neb_batch_item),allocatable :: tmp(:)
+
+    error=0
+    resolved=.false.
+    event_ok=.false.
+    forward_barrier=100.0_rk
+    reverse_barrier=100.0_rk
+    is_exch=present(initial_id)
+    ml_tol2=kmc%ml_tol*kmc%ml_tol
+    zero_tol=kmc%neb_error
+    tf=nn_final_val
+    cr=nn_final_val
+    cm=0
+    js=0
+    if (is_exch) then
+      cf=kmc%system%sites(initial_id)%nn
+      cm=kmc%system%sites(site_id)%nn
+      tr=kmc%system%sites(initial_id)%nn
+    else
+      js=NN_SHELL_TO_JUMP_SHELL(shell,kmc%system%crystal_structure)
+      if (js<=0) then
+        write(0,"(a,i0,a)") "*** Error: invalid shell ",shell," in prepare_barrier_or_queue()"
+        error=1
+        return
+      endif
+      cf=kmc%system%sites(site_id)%nn
+      tr=kmc%system%sites(site_id)%nn
+    endif
+
+    if (.not. is_exch) then
+      if (.not. kmc%hop_predictor(cf,tf,js)%initialised) then
+        call initialise_predictor(kmc%hop_predictor(cf,tf,js),kmc%n_data_min,kmc%n_data_max,&
+          kmc%n_sparse_max,kmc%desc_str,delta=kmc%delta,zeta=kmc%zeta,&
+          covariance_type=kmc%covariance_type,regularisation=kmc%regularisation)
+      endif
+      if (.not. kmc%hop_predictor(cr,tr,js)%initialised) then
+        call initialise_predictor(kmc%hop_predictor(cr,tr,js),kmc%n_data_min,kmc%n_data_max,&
+          kmc%n_sparse_max,kmc%desc_str,delta=kmc%delta,zeta=kmc%zeta,&
+          covariance_type=kmc%covariance_type,regularisation=kmc%regularisation)
+      endif
+    else
+      if (.not. kmc%exchange_predictor(cm,cf,tf)%initialised) then
+        call initialise_predictor(kmc%exchange_predictor(cm,cf,tf),kmc%n_data_min,kmc%n_data_max,&
+          kmc%n_sparse_max,kmc%desc_str,delta=kmc%delta,zeta=kmc%zeta,&
+          covariance_type=kmc%covariance_type,regularisation=kmc%regularisation)
+      endif
+      if (.not. kmc%exchange_predictor(cm,cr,tr)%initialised) then
+        call initialise_predictor(kmc%exchange_predictor(cm,cr,tr),kmc%n_data_min,kmc%n_data_max,&
+          kmc%n_sparse_max,kmc%desc_str,delta=kmc%delta,zeta=kmc%zeta,&
+          covariance_type=kmc%covariance_type,regularisation=kmc%regularisation)
+      endif
+    endif
+
+    ml_fwd_called=.false.
+    ml_rev_called=.false.
+    if (.not. is_exch) then
+      if (kmc%hop_predictor(cf,tf,js)%fitted) then
+        t1=mpi_wtime()
+        call predict(kmc%hop_predictor(cf,tf,js),desc_fwd,ml_fwd_b,fwd_var,error=error)
+        t2=mpi_wtime()
+        kmc%predict_time=kmc%predict_time+t2-t1
+        if (error/=0) return
+        ml_fwd_called=.true.
+      endif
+      if (kmc%hop_predictor(cr,tr,js)%fitted) then
+        t1=mpi_wtime()
+        call predict(kmc%hop_predictor(cr,tr,js),desc_rev,ml_rev_b,rev_var,error=error)
+        t2=mpi_wtime()
+        kmc%predict_time=kmc%predict_time+t2-t1
+        if (error/=0) return
+        ml_rev_called=.true.
+      endif
+    else
+      if (kmc%exchange_predictor(cm,cf,tf)%fitted) then
+        t1=mpi_wtime()
+        call predict(kmc%exchange_predictor(cm,cf,tf),desc_fwd,ml_fwd_b,fwd_var,error=error)
+        t2=mpi_wtime()
+        kmc%predict_time=kmc%predict_time+t2-t1
+        if (error/=0) return
+        ml_fwd_called=.true.
+      endif
+      if (kmc%exchange_predictor(cm,cr,tr)%fitted) then
+        t1=mpi_wtime()
+        call predict(kmc%exchange_predictor(cm,cr,tr),desc_rev,ml_rev_b,rev_var,error=error)
+        t2=mpi_wtime()
+        kmc%predict_time=kmc%predict_time+t2-t1
+        if (error/=0) return
+        ml_rev_called=.true.
+      endif
+    endif
+
+    if (ml_fwd_called .and. ml_rev_called .and. fwd_var<ml_tol2 .and. rev_var<ml_tol2 &
+        .and. ml_fwd_b==ml_fwd_b .and. ml_fwd_b>=-zero_tol &
+        .and. ml_rev_b==ml_rev_b .and. ml_rev_b>=-zero_tol) then
+      forward_barrier=ml_fwd_b
+      reverse_barrier=ml_rev_b
+      event_ok=(reverse_barrier>0.0_rk)
+      resolved=.true.
+      return
+    endif
+
+    if (.not. is_exch) then
+      fwd_exists=data_point_exists(kmc%hop_predictor(cf,tf,js),desc_fwd,y=neb_fwd_b)
+      rev_exists=data_point_exists(kmc%hop_predictor(cr,tr,js),desc_rev,y=neb_rev_b)
+      fwd_full=kmc%hop_predictor(cf,tf,js)%n_y>=kmc%hop_predictor(cf,tf,js)%n_y_max
+      rev_full=kmc%hop_predictor(cr,tr,js)%n_y>=kmc%hop_predictor(cr,tr,js)%n_y_max
+    else
+      fwd_exists=data_point_exists(kmc%exchange_predictor(cm,cf,tf),desc_fwd,y=neb_fwd_b)
+      rev_exists=data_point_exists(kmc%exchange_predictor(cm,cr,tr),desc_rev,y=neb_rev_b)
+      fwd_full=kmc%exchange_predictor(cm,cf,tf)%n_y>=kmc%exchange_predictor(cm,cf,tf)%n_y_max
+      rev_full=kmc%exchange_predictor(cm,cr,tr)%n_y>=kmc%exchange_predictor(cm,cr,tr)%n_y_max
+    endif
+
+    if (fwd_exists .and. rev_exists) then
+      forward_barrier=neb_fwd_b
+      reverse_barrier=neb_rev_b
+      event_ok=(reverse_barrier>0.0_rk)
+      resolved=.true.
+      return
+    endif
+
+    if (fwd_full .and. rev_full) then
+      if (ml_fwd_called .and. ml_rev_called .and. ml_fwd_b==ml_fwd_b .and. ml_rev_b==ml_rev_b) then
+        forward_barrier=ml_fwd_b
+        reverse_barrier=ml_rev_b
+        event_ok=(reverse_barrier>0.0_rk)
+      else
+        event_ok=.false.
+      endif
+      resolved=.true.
+      return
+    endif
+
+    if (kmc%verbosity>=VERBOSITY_NORMAL) write(6,"(a)") "# Getting barrier from NEB..."
+    final_relaxed=.false.
+    if (minim_result==MINIM_RESULT_SUCCESS) then
+      final_relaxed=.true.
+    elseif (minim_result==MINIM_RESULT_FAIL) then
+      resolved=.true.
+      event_ok=.false.
+      return
+    else
+      if (kmc%verbosity>=VERBOSITY_NORMAL) write(6,"(a)") "# Minimizing final configuration..."
+      kmc%minim_cache_index=kmc%minim_cache_index+1
+      if (kmc%minim_cache_index>MINIM_CACHE_SIZE) kmc%minim_cache_index=1
+      kmc%minim_cache(:,:,kmc%minim_cache_index)=fingerprint
+      final_cfg=init
+      final_cfg%pos(:,kmc%system%sites(site_id)%id)=kmc%system%sites(final_id)%cartesian_coords(:)
+      if (is_exch) final_cfg%pos(:,kmc%system%sites(initial_id)%id)=kmc%system%sites(site_id)%cartesian_coords(:)
+      final_cfg_rel=final_cfg
+      if (kmc%swiftmd%ftol_override>0.0d0) then
+        ftol=kmc%swiftmd%ftol_override
+      else
+        ftol=0.1d0*kmc%relax_tol
+      endif
+      t1=mpi_wtime()
+      call swiftmd_minimize_cfg(kmc%swiftmd,kmc%system,final_cfg,kmc%system%sites(final_id)%cartesian_coords(:),&
+                                kmc%swiftmd%min_etol,ftol,0.1d0,kmc%neb_steps,final_cfg_rel%pos,error)
+      kmc%minimizations=kmc%minimizations+1
+      t2=mpi_wtime()
+      kmc%minimize_time=kmc%minimize_time+t2-t1
+      if (error/=0) then
+        call dealloc_atoms(final_cfg)
+        call dealloc_atoms(final_cfg_rel)
+        return
+      endif
+
+      n_chk=1
+      chk(1)=kmc%system%sites(site_id)%id
+      if (is_exch) then
+        n_chk=2
+        chk(2)=kmc%system%sites(initial_id)%id
+      endif
+      do nn_sh=TRUE_1NN_SHELL(kmc%system%crystal_structure),CLOSE_NEIGH_SHELL(kmc%system%crystal_structure)
+        do nn_a=1,kmc%system%sites(site_id)%neighbour_shells(nn_sh)%n_neighbour_sites
+          nn_id=kmc%system%sites(site_id)%neighbour_shells(nn_sh)%neighbour_sites(nn_a)
+          if (kmc%system%sites(nn_id)%Z>0 .and. .not. kmc%system%sites(nn_id)%substrate) then
+            id=kmc%system%sites(nn_id)%id
+            in_chk=any(chk(1:n_chk)==id)
+            if (.not. in_chk) then
+              n_chk=n_chk+1
+              chk(n_chk)=id
+            endif
+          endif
+        end do
+        do nn_a=1,kmc%system%sites(final_id)%neighbour_shells(nn_sh)%n_neighbour_sites
+          nn_id=kmc%system%sites(final_id)%neighbour_shells(nn_sh)%neighbour_sites(nn_a)
+          if (kmc%system%sites(nn_id)%Z>0 .and. .not. kmc%system%sites(nn_id)%substrate) then
+            id=kmc%system%sites(nn_id)%id
+            in_chk=any(chk(1:n_chk)==id)
+            if (.not. in_chk) then
+              n_chk=n_chk+1
+              chk(n_chk)=id
+            endif
+          endif
+        end do
+        if (is_exch) then
+          do nn_a=1,kmc%system%sites(initial_id)%neighbour_shells(nn_sh)%n_neighbour_sites
+            nn_id=kmc%system%sites(initial_id)%neighbour_shells(nn_sh)%neighbour_sites(nn_a)
+            if (kmc%system%sites(nn_id)%Z>0 .and. .not. kmc%system%sites(nn_id)%substrate) then
+              id=kmc%system%sites(nn_id)%id
+              in_chk=any(chk(1:n_chk)==id)
+              if (.not. in_chk) then
+                n_chk=n_chk+1
+                chk(n_chk)=id
+              endif
+            endif
+          end do
+        endif
+      end do
+      disp2=max_displacement2(final_cfg,final_cfg_rel,chk,n_chk)
+      call dealloc_atoms(final_cfg)
+      call dealloc_atoms(final_cfg_rel)
+      if (disp2<kmc%system%relax_displacement_tol2) then
+        final_relaxed=.true.
+        kmc%minim_cache_results(kmc%minim_cache_index)=MINIM_RESULT_SUCCESS
+        if (kmc%verbosity>=VERBOSITY_NORMAL) write(6,"(a)") "# Final configuration minimized"
+      else
+        kmc%minim_cache_results(kmc%minim_cache_index)=MINIM_RESULT_FAIL
+        if (kmc%verbosity>=VERBOSITY_NORMAL) then
+          write(6,"(a)") "# Final configuration minimization failed:"
+          write(6,"(a)") "# too large displacement when relaxing the final configuration."
+        endif
+        resolved=.true.
+        event_ok=.false.
+        return
+      endif
+    endif
+
+    if (.not. final_relaxed) then
+      resolved=.true.
+      event_ok=.false.
+      return
+    endif
+
+    item%is_exchange=is_exch
+    item%atom_idx=atom_idx
+    item%site_id=site_id
+    item%final_id=final_id
+    if (is_exch) item%initial_id=initial_id
+    item%nn_atom=nn_atom
+    item%jump_shell=jump_shell
+    item%shell=shell
+    item%initial_site=initial_site
+    item%final_site=final_site
+    item%only_substrate_jump=only_substrate_jump
+    item%coord_jumping_fwd=cf
+    item%coord_target_fwd=tf
+    item%coord_middle=cm
+    item%coord_jumping_rev=cr
+    item%coord_target_rev=tr
+    item%desc_fwd=desc_fwd
+    item%desc_rev=desc_rev
+    item%cov_fwd=cov_fwd
+    item%cov_rev=cov_rev
+    item%fwd_data_exists=fwd_exists
+    item%rev_data_exists=rev_exists
+    item%fwd_ml_full=fwd_full
+    item%rev_ml_full=rev_full
+    item%alias_of=0
+    item%alias_swap=.false.
+    item%submit_idx=0
+
+    if (only_substrate_jump==SUBSTRATE_FCC_HCP) then
+      if (sub_fcc_hcp_item>0) then
+        item%alias_of=sub_fcc_hcp_item
+      elseif (sub_hcp_fcc_item>0) then
+        item%alias_of=sub_hcp_fcc_item
+        item%alias_swap=.true.
+      endif
+    elseif (only_substrate_jump==SUBSTRATE_HCP_FCC) then
+      if (sub_hcp_fcc_item>0) then
+        item%alias_of=sub_hcp_fcc_item
+      elseif (sub_fcc_hcp_item>0) then
+        item%alias_of=sub_fcc_hcp_item
+        item%alias_swap=.true.
+      endif
+    endif
+
+    if (item%alias_of==0) then
+      do m=1,n_pending
+        if (pending(m)%alias_of/=0) cycle
+        if (pending(m)%is_exchange .neqv. is_exch) cycle
+        if (pending(m)%jump_shell/=jump_shell .or. pending(m)%coord_middle/=cm) cycle
+        if (pending(m)%coord_jumping_fwd/=cf .or. pending(m)%coord_target_fwd/=tf) cycle
+        if (pending(m)%coord_jumping_rev/=cr .or. pending(m)%coord_target_rev/=tr) cycle
+        if (normsq(pending(m)%desc_fwd-desc_fwd)<DUPLICATE_TOL .and. &
+            normsq(pending(m)%desc_rev-desc_rev)<DUPLICATE_TOL) then
+          item%alias_of=m
+          exit
+        endif
+      end do
+    endif
+
+    if (item%alias_of==0) then
+      if (is_exch) then
+        item%jumping_atom_i=kmc%system%sites(initial_id)%id
+        item%middle_atom_i=kmc%system%sites(site_id)%id
+        item%disp1=system_diff_min_image(kmc%system,initial_id,site_id)
+        item%disp2=system_diff_min_image(kmc%system,site_id,final_id)
+      else
+        item%jumping_atom_i=kmc%system%sites(site_id)%id
+        item%middle_atom_i=0
+        item%disp1=system_diff_min_image(kmc%system,site_id,final_id)
+        item%disp2=0.0_rk
+      endif
+      n_submit=n_submit+1
+      item%submit_idx=n_submit
+    endif
+
+    if (.not. allocated(pending)) then
+      allocate(pending(64))
+    elseif (n_pending>=size(pending)) then
+      old_cap=size(pending)
+      allocate(tmp(old_cap*2))
+      tmp(1:old_cap)=pending(1:old_cap)
+      call move_alloc(tmp,pending)
+    endif
+    n_pending=n_pending+1
+    pending(n_pending)=item
+    if (only_substrate_jump==SUBSTRATE_FCC_HCP .and. sub_fcc_hcp_item==0 .and. item%alias_of==0) then
+      sub_fcc_hcp_item=n_pending
+    elseif (only_substrate_jump==SUBSTRATE_HCP_FCC .and. sub_hcp_fcc_item==0 .and. item%alias_of==0) then
+      sub_hcp_fcc_item=n_pending
+    endif
+  end subroutine prepare_barrier_or_queue
+
+  subroutine flush_neb_batch(kmc,init_cfg,pending,n_pending,n_submit,atom_blocked,atom_n_blocked,error)
+    type(t_kmc),intent(inout) :: kmc
+    type(t_atoms),intent(in) :: init_cfg
+    type(t_neb_batch_item),intent(inout) :: pending(:)
+    integer,intent(in) :: n_pending,n_submit
+    integer,allocatable,intent(inout) :: atom_blocked(:,:)
+    integer,intent(inout) :: atom_n_blocked(:)
+    integer,intent(out) :: error
+
+    integer :: p,s,nn_nn_atom,nn_id,cryst,cf,tf,cm,cr,tr,js,site_id,final_id,ak
+    integer :: jatoms(max(1,n_submit)),matoms(max(1,n_submit)),steps_arr(max(1,n_submit)),conv_arr(max(1,n_submit))
+    real(kind=rk) :: d1(3,max(1,n_submit)),d2(3,max(1,n_submit)),barrier,rev_barrier
+    double precision :: bfwd(max(1,n_submit)),brev(max(1,n_submit)),fmax_arr(max(1,n_submit)),ftol,t1,t2
+    logical :: event_ok,train_ok,fwd_ex,rev_ex,untrainable
+    integer :: mod_type(2*max(1,n_pending)),mod_c1(2*max(1,n_pending)),mod_c2(2*max(1,n_pending)),mod_c3(2*max(1,n_pending))
+    integer :: n_mod,m_idx
+    logical :: seen
+
+    error=0
+    if (n_pending<=0) return
+    cryst=kmc%system%crystal_structure
+
+    if (n_submit>0) then
+      s=0
+      do p=1,n_pending
+        if (pending(p)%alias_of==0) then
+          s=s+1
+          jatoms(s)=pending(p)%jumping_atom_i
+          matoms(s)=pending(p)%middle_atom_i
+          d1(:,s)=pending(p)%disp1
+          d2(:,s)=pending(p)%disp2
+        endif
+      end do
+      if (kmc%swiftmd%ftol_override>0.0d0) then
+        ftol=kmc%swiftmd%ftol_override
+      else
+        ftol=0.1d0*kmc%relax_tol
+      endif
+      if (kmc%verbosity>=VERBOSITY_NORMAL) then
+        if (n_submit==1 .and. kmc%swiftmd%use_gpu==0) then
+          write(6,"(a)") "# Running NEB..."
+        else
+          write(6,"(a,i0,a)") "# Running NEB batch (M=",n_submit,")..."
+        endif
+      endif
+      t1=mpi_wtime()
+      if (n_submit==1 .and. kmc%swiftmd%use_gpu==0) then
+        call swiftmd_neb_cfg(kmc%swiftmd,kmc%system,init_cfg,jatoms(1),d1(:,1),matoms(1),&
+                             d1(:,1),d2(:,1),kmc%neb_images,kmc%neb_spring,kmc%swiftmd%climb,&
+                             kmc%swiftmd%neb_etol,ftol,0.01d0,2*kmc%neb_steps,&
+                             bfwd(1),brev(1),error,fmax_res=fmax_arr(1),converged_res=conv_arr(1))
+        steps_arr(1)=0
+      else
+        call swiftmd_neb_batch_cfg(kmc%swiftmd,kmc%system,init_cfg,n_submit,jatoms(1:n_submit),matoms(1:n_submit),&
+                                   d1(:,1:n_submit),d2(:,1:n_submit),kmc%neb_images,kmc%neb_spring,kmc%swiftmd%climb,&
+                                   kmc%swiftmd%neb_etol,ftol,0.01d0,2*kmc%neb_steps,&
+                                   bfwd(1:n_submit),brev(1:n_submit),fmax_arr(1:n_submit),steps_arr(1:n_submit),&
+                                   conv_arr(1:n_submit),error)
+      endif
+      t2=mpi_wtime()
+      kmc%neb_barrier_time=kmc%neb_barrier_time+t2-t1
+      if (error/=0) return
+      kmc%neb_calculations=kmc%neb_calculations+n_submit
+    endif
+
+    n_mod=0
+    do p=1,n_pending
+      if (pending(p)%alias_of>0) then
+        s=pending(pending(p)%alias_of)%submit_idx
+      else
+        s=pending(p)%submit_idx
+      endif
+      if (pending(p)%alias_swap) then
+        barrier=brev(s)
+        rev_barrier=bfwd(s)
+      else
+        barrier=bfwd(s)
+        rev_barrier=brev(s)
+      endif
+      untrainable=(conv_arr(s)==0 .and. kmc%neb_reject_fmax>0.0d0 .and. fmax_arr(s)>kmc%neb_reject_fmax)
+      if (untrainable .and. pending(p)%alias_of==0) kmc%neb_untrainable=kmc%neb_untrainable+1
+      event_ok=(rev_barrier>0.0_rk)
+      train_ok=event_ok .and. .not. untrainable
+
+      cf=pending(p)%coord_jumping_fwd
+      tf=pending(p)%coord_target_fwd
+      cm=pending(p)%coord_middle
+      cr=pending(p)%coord_jumping_rev
+      tr=pending(p)%coord_target_rev
+      js=pending(p)%jump_shell
+      site_id=pending(p)%site_id
+      final_id=pending(p)%final_id
+      ak=pending(p)%atom_idx
+
+      if (.not. pending(p)%is_exchange) then
+        if (.not. pending(p)%fwd_ml_full .or. .not. pending(p)%rev_ml_full) then
+          if (train_ok) then
+            fwd_ex=pending(p)%fwd_data_exists .or. data_point_exists(kmc%hop_predictor(cf,tf,js),pending(p)%desc_fwd)
+            if (kmc%hop_predictor(cf,tf,js)%n_y<kmc%hop_predictor(cf,tf,js)%n_y_max .and. .not. fwd_ex) then
+              call add_data_point(kmc%hop_predictor(cf,tf,js),pending(p)%desc_fwd,real(barrier,kind=dp),&
+                                  kmc%neb_error,pending(p)%cov_fwd,error=error)
+              if (error==2) error=0
+              if (error/=0) return
+              if (kmc%hop_predictor(cf,tf,js)%n_y>=kmc%hop_predictor(cf,tf,js)%n_y_min) then
+                seen=.false.
+                do m_idx=1,n_mod
+                  if (mod_type(m_idx)==0 .and. mod_c1(m_idx)==cf .and. mod_c2(m_idx)==tf .and. mod_c3(m_idx)==js) seen=.true.
+                end do
+                if (.not. seen) then
+                  n_mod=n_mod+1; mod_type(n_mod)=0; mod_c1(n_mod)=cf; mod_c2(n_mod)=tf; mod_c3(n_mod)=js
+                endif
+              endif
+            endif
+            rev_ex=pending(p)%rev_data_exists .or. data_point_exists(kmc%hop_predictor(cr,tr,js),pending(p)%desc_rev)
+            if (kmc%hop_predictor(cr,tr,js)%n_y<kmc%hop_predictor(cr,tr,js)%n_y_max .and. .not. rev_ex) then
+              call add_data_point(kmc%hop_predictor(cr,tr,js),pending(p)%desc_rev,real(rev_barrier,kind=dp),&
+                                  kmc%neb_error,pending(p)%cov_rev,error=error)
+              if (error==2) error=0
+              if (error/=0) return
+              if (kmc%hop_predictor(cr,tr,js)%n_y>=kmc%hop_predictor(cr,tr,js)%n_y_min) then
+                seen=.false.
+                do m_idx=1,n_mod
+                  if (mod_type(m_idx)==0 .and. mod_c1(m_idx)==cr .and. mod_c2(m_idx)==tr .and. mod_c3(m_idx)==js) seen=.true.
+                end do
+                if (.not. seen) then
+                  n_mod=n_mod+1; mod_type(n_mod)=0; mod_c1(n_mod)=cr; mod_c2(n_mod)=tr; mod_c3(n_mod)=js
+                endif
+              endif
+            endif
+          endif
+        endif
+        if (event_ok) then
+          do nn_nn_atom=1,kmc%system%sites(final_id)%neighbour_shells(JUMP_SHELLS(1,cryst))%n_neighbour_sites
+            nn_id=kmc%system%sites(final_id)%neighbour_shells(JUMP_SHELLS(1,cryst))%neighbour_sites(nn_nn_atom)
+            if (kmc%system%sites(nn_id)%Z==0) call mark_atom_blocked(atom_blocked,atom_n_blocked,ak,nn_id)
+          end do
+          barrier=max(0.0_rk,barrier)
+          if (barrier>0.0_rk) then
+            rev_barrier=max(0.0_rk,rev_barrier)
+          else
+            rev_barrier=100.0_rk
+          endif
+          kmc%system%sites(site_id)%hop_barriers(1,pending(p)%nn_atom,js)=barrier
+          kmc%system%sites(site_id)%hop_barriers(2,pending(p)%nn_atom,js)=rev_barrier
+          kmc%system%sites(site_id)%hop_rates(pending(p)%nn_atom,js)=&
+            kmc%attempt_frequency*exp(-real(barrier,kind=dp)/kmc%kT)
+          kmc%system%sites(site_id)%hop_states(pending(p)%nn_atom,js)=EVENT_VALID
+          if (pending(p)%only_substrate_jump==SUBSTRATE_FCC_HCP) then
+            if (kmc%substrate_fcc_hcp_barrier<0.0_rk .and. kmc%substrate_hcp_fcc_barrier<0.0_rk) then
+              kmc%substrate_fcc_hcp_barrier=barrier
+              kmc%substrate_hcp_fcc_barrier=rev_barrier
+            endif
+          elseif (pending(p)%only_substrate_jump==SUBSTRATE_HCP_FCC) then
+            if (kmc%substrate_fcc_hcp_barrier<0.0_rk .and. kmc%substrate_hcp_fcc_barrier<0.0_rk) then
+              kmc%substrate_hcp_fcc_barrier=barrier
+              kmc%substrate_fcc_hcp_barrier=rev_barrier
+            endif
+          endif
+        else
+          kmc%system%sites(site_id)%hop_states(pending(p)%nn_atom,js)=EVENT_FORBIDDEN
+        endif
+      else
+        if (.not. pending(p)%fwd_ml_full .or. .not. pending(p)%rev_ml_full) then
+          if (train_ok) then
+            fwd_ex=pending(p)%fwd_data_exists .or. data_point_exists(kmc%exchange_predictor(cm,cf,tf),pending(p)%desc_fwd)
+            if (kmc%exchange_predictor(cm,cf,tf)%n_y<kmc%exchange_predictor(cm,cf,tf)%n_y_max .and. .not. fwd_ex) then
+              call add_data_point(kmc%exchange_predictor(cm,cf,tf),pending(p)%desc_fwd,real(barrier,kind=dp),&
+                                  kmc%neb_error,pending(p)%cov_fwd,error=error)
+              if (error==2) error=0
+              if (error/=0) return
+              if (kmc%exchange_predictor(cm,cf,tf)%n_y>=kmc%exchange_predictor(cm,cf,tf)%n_y_min) then
+                seen=.false.
+                do m_idx=1,n_mod
+                  if (mod_type(m_idx)==1 .and. mod_c1(m_idx)==cm .and. mod_c2(m_idx)==cf .and. mod_c3(m_idx)==tf) seen=.true.
+                end do
+                if (.not. seen) then
+                  n_mod=n_mod+1; mod_type(n_mod)=1; mod_c1(n_mod)=cm; mod_c2(n_mod)=cf; mod_c3(n_mod)=tf
+                endif
+              endif
+            endif
+            rev_ex=pending(p)%rev_data_exists .or. data_point_exists(kmc%exchange_predictor(cm,cr,tr),pending(p)%desc_rev)
+            if (kmc%exchange_predictor(cm,cr,tr)%n_y<kmc%exchange_predictor(cm,cr,tr)%n_y_max .and. .not. rev_ex) then
+              call add_data_point(kmc%exchange_predictor(cm,cr,tr),pending(p)%desc_rev,real(rev_barrier,kind=dp),&
+                                  kmc%neb_error,pending(p)%cov_rev,error=error)
+              if (error==2) error=0
+              if (error/=0) return
+              if (kmc%exchange_predictor(cm,cr,tr)%n_y>=kmc%exchange_predictor(cm,cr,tr)%n_y_min) then
+                seen=.false.
+                do m_idx=1,n_mod
+                  if (mod_type(m_idx)==1 .and. mod_c1(m_idx)==cm .and. mod_c2(m_idx)==cr .and. mod_c3(m_idx)==tr) seen=.true.
+                end do
+                if (.not. seen) then
+                  n_mod=n_mod+1; mod_type(n_mod)=1; mod_c1(n_mod)=cm; mod_c2(n_mod)=cr; mod_c3(n_mod)=tr
+                endif
+              endif
+            endif
+          endif
+        endif
+        if (event_ok) then
+          barrier=max(0.0_rk,barrier)
+          if (barrier>0.0_rk) then
+            rev_barrier=max(0.0_rk,rev_barrier)
+          else
+            rev_barrier=100.0_rk
+          endif
+          kmc%system%sites(site_id)%exchange_barriers(1,pending(p)%final_site,pending(p)%initial_site)=barrier
+          kmc%system%sites(site_id)%exchange_barriers(2,pending(p)%final_site,pending(p)%initial_site)=rev_barrier
+          kmc%system%sites(site_id)%exchange_rates(pending(p)%final_site,pending(p)%initial_site)=&
+            kmc%attempt_frequency*exp(-real(barrier,kind=dp)/kmc%kT)
+          kmc%system%sites(site_id)%exchange_states(pending(p)%final_site,pending(p)%initial_site)=EVENT_VALID
+        else
+          kmc%system%sites(site_id)%exchange_states(pending(p)%final_site,pending(p)%initial_site)=EVENT_FORBIDDEN
+        endif
+      endif
+    end do
+
+    do m_idx=1,n_mod
+      t1=mpi_wtime()
+      if (mod_type(m_idx)==0) then
+        call fit_predictor(kmc%hop_predictor(mod_c1(m_idx),mod_c2(m_idx),mod_c3(m_idx)),error=error)
+      else
+        call fit_predictor(kmc%exchange_predictor(mod_c1(m_idx),mod_c2(m_idx),mod_c3(m_idx)),error=error)
+      endif
+      t2=mpi_wtime()
+      kmc%fit_time=kmc%fit_time+t2-t1
+      if (error/=0) return
+    end do
+  end subroutine flush_neb_batch
+
+  subroutine get_rates_swiftmd_batch(kmc,lmp,myrank,error)
+    type(t_kmc),intent(inout) :: kmc
+    type(lammps),intent(inout) :: lmp
+    integer,intent(in) :: myrank
+    integer,optional,intent(out) :: error
+
+    integer :: internal_error,i,k,site_id,n_deposited,n_unchecked,final_id,initial_id
+    integer :: shell,jump_shell,nn_atom,nn_nn_atom,initial_site,final_site
+    integer :: n_near_final,nn_final,only_substrate_jump,max_jump_shell,max_nn,max_1nn,nn_id,nn_nn_id,cryst
+    integer :: fingerprint(kmc%nZ,0:NN_SHELLS),minim_result,s_chk,needed_cap
+    integer :: n_neighbour_sites(NN_SHELLS),sub_fcc_hcp_item,sub_hcp_fcc_item
+    integer,save :: lae_index=1
+    integer,allocatable,save :: unchecked_sites(:),atom_n_blocked(:),atom_blocked(:,:),dep_sorted(:)
+    integer,allocatable,save :: hop_states_k(:,:,:),exch_states_k(:,:,:)
+    logical,allocatable,save :: locked_k(:)
+    double precision,allocatable,save :: desc_fwd_vec(:),desc_rev_vec(:)
+    type(t_neb_batch_item),allocatable,save :: pending(:)
+    integer :: n_pending,n_submit,k_dep,dep_key,j_dep
+    real(kind=rk) :: barrier,reverse_barrier,hop_sum,exch_sum
+    double precision :: cov_fwd,cov_rev,t1,t2
+    logical :: event_ok,nan_detected,obstructed,resolved,allow_exchange
+    type(t_atoms) :: initial_config
+
+    if (present(error)) error=0
+    internal_error=0
+    t1=mpi_wtime()
+    initial_config%initialised=.false.
+    cryst=kmc%system%crystal_structure
+    max_nn=kmc%system%max_nn
+    max_1nn=kmc%system%max_1nn
+    max_jump_shell=kmc%system%max_jump_shell
+    allow_exchange=kmc%system%allow_exchange
+    n_deposited=kmc%system%n_deposited
+
+    if (n_deposited>0) then
+      if (.not. allocated(unchecked_sites)) then
+        needed_cap=max(n_deposited,64)
+        allocate(unchecked_sites(needed_cap),atom_n_blocked(needed_cap),locked_k(needed_cap))
+        allocate(atom_blocked(64,needed_cap))
+        allocate(hop_states_k(max(1,max_nn),max(1,max_jump_shell),needed_cap))
+        allocate(exch_states_k(max(1,max_1nn),max(1,max_1nn),needed_cap))
+      elseif (size(unchecked_sites)<n_deposited .or. size(hop_states_k,1)<max_nn .or. &
+              size(hop_states_k,2)<max_jump_shell .or. size(exch_states_k,1)<max_1nn) then
+        needed_cap=max(n_deposited,size(unchecked_sites))
+        deallocate(unchecked_sites,atom_n_blocked,locked_k,atom_blocked,hop_states_k,exch_states_k)
+        allocate(unchecked_sites(needed_cap),atom_n_blocked(needed_cap),locked_k(needed_cap))
+        allocate(atom_blocked(64,needed_cap))
+        allocate(hop_states_k(max(1,max_nn),max(1,max_jump_shell),needed_cap))
+        allocate(exch_states_k(max(1,max_1nn),max(1,max_1nn),needed_cap))
+      endif
+    endif
+
+    n_unchecked=0
+    do i=1,n_deposited
+      site_id=kmc%system%deposited_atoms(i)
+      if (kmc%system%sites(site_id)%locked) then
+        kmc%system%sites(site_id)%hop_states(1:kmc%system%sites(site_id)%max_nn,1:max_jump_shell)=EVENT_FORBIDDEN
+        kmc%system%sites(site_id)%hop_rate=0.0_rk
+      endif
+      if (.not. kmc%system%sites(site_id)%jumps_checked) then
+        n_unchecked=n_unchecked+1
+        unchecked_sites(n_unchecked)=site_id
+        atom_n_blocked(n_unchecked)=0
+        locked_k(n_unchecked)=kmc%system%sites(site_id)%locked
+        hop_states_k(:,:,n_unchecked)=EVENT_FORBIDDEN
+        if (.not. locked_k(n_unchecked)) then
+          hop_states_k(1:kmc%system%sites(site_id)%max_nn,1:max_jump_shell,n_unchecked)=&
+            kmc%system%sites(site_id)%hop_states(1:kmc%system%sites(site_id)%max_nn,1:max_jump_shell)
+        endif
+        if (allow_exchange) then
+          exch_states_k(:,:,n_unchecked)=EVENT_FORBIDDEN
+          exch_states_k(1:kmc%system%sites(site_id)%neighbour_shells(TRUE_1NN_SHELL(cryst))%n_neighbour_sites,&
+                        1:kmc%system%sites(site_id)%neighbour_shells(TRUE_1NN_SHELL(cryst))%n_neighbour_sites,&
+                        n_unchecked)=kmc%system%sites(site_id)%exchange_states(&
+                          1:kmc%system%sites(site_id)%neighbour_shells(TRUE_1NN_SHELL(cryst))%n_neighbour_sites,&
+                          1:kmc%system%sites(site_id)%neighbour_shells(TRUE_1NN_SHELL(cryst))%n_neighbour_sites)
+        endif
+      endif
+    end do
+    t2=mpi_wtime()
+    kmc%get_rates_overhead_time=kmc%get_rates_overhead_time+t2-t1
+
+    if (n_unchecked>0) then
+      do jump_shell=1,max_jump_shell
+        shell=JUMP_SHELLS(jump_shell,cryst)
+        n_pending=0
+        n_submit=0
+        sub_fcc_hcp_item=0
+        sub_hcp_fcc_item=0
+        do k=1,n_unchecked
+          if (locked_k(k)) cycle
+          site_id=unchecked_sites(k)
+          n_neighbour_sites=kmc%system%sites(site_id)%neighbour_shells(:)%n_neighbour_sites
+          do nn_atom=1,n_neighbour_sites(shell)
+            obstructed=.false.
+            t1=mpi_wtime()
+            final_id=kmc%system%sites(site_id)%neighbour_shells(shell)%neighbour_sites(nn_atom)
+            if (hop_states_k(nn_atom,jump_shell,k)==EVENT_VALID) then
+              call mark_atom_blocked(atom_blocked,atom_n_blocked,k,final_id)
+            endif
+            if (is_atom_blocked(atom_blocked,atom_n_blocked,k,final_id)) then
+              obstructed=.true.
+              do nn_nn_atom=1,kmc%system%sites(final_id)%neighbour_shells(JUMP_SHELLS(1,cryst))%n_neighbour_sites
+                nn_nn_id=kmc%system%sites(final_id)%neighbour_shells(JUMP_SHELLS(1,cryst))%neighbour_sites(nn_nn_atom)
+                if (kmc%system%sites(nn_nn_id)%Z==0) call mark_atom_blocked(atom_blocked,atom_n_blocked,k,nn_nn_id)
+              end do
+            endif
+            if (hop_states_k(nn_atom,jump_shell,k)==EVENT_VALID .or. &
+                hop_states_k(nn_atom,jump_shell,k)==EVENT_FORBIDDEN) then
+              t2=mpi_wtime()
+              kmc%event_finding_time=kmc%event_finding_time+t2-t1
+              cycle
+            endif
+            t2=mpi_wtime()
+            kmc%event_finding_time=kmc%event_finding_time+t2-t1
+
+            if (.not. obstructed) then
+              if (kmc%system%sites(final_id)%Z/=0) then
+                obstructed=.true.
+              else
+                n_near_final=kmc%system%sites(final_id)%n_near
+                if (shell<TRUE_1NN_SHELL(cryst)) n_near_final=n_near_final-1
+                nn_final=kmc%system%sites(final_id)%nn
+                if (shell==TRUE_1NN_SHELL(cryst)) nn_final=nn_final-1
+                if (nn_final<N_NN_MIN(cryst) .or. n_near_final>0) obstructed=.true.
+              endif
+            endif
+
+            only_substrate_jump=SUBSTRATE_NOT
+            if (.not. obstructed) then
+              if (cryst==CRYSTAL_STRUCTURE_CLOSE_PACKED .and. kmc%system%orientation==ORIENTATION_111) then
+                t1=mpi_wtime()
+                call only_substrate_lae(kmc,site_id,final_id,only_substrate_jump,error=internal_error)
+                t2=mpi_wtime()
+                kmc%lae_sub_time=kmc%lae_sub_time+t2-t1
+                if (internal_error/=0) then
+                  if (present(error)) error=internal_error
+                  if (initial_config%initialised) call dealloc_atoms(initial_config)
+                  return
+                endif
+              endif
+            endif
+            if (.not. obstructed .and. only_substrate_jump==SUBSTRATE_NOT) then
+              t1=mpi_wtime()
+              call create_fingerprint(kmc,site_id,final_id,fingerprint,jump_shell=jump_shell,error=internal_error)
+              t2=mpi_wtime()
+              kmc%rate_fingerprint_time=kmc%rate_fingerprint_time+t2-t1
+              if (internal_error/=0) then
+                if (present(error)) error=internal_error
+                if (initial_config%initialised) call dealloc_atoms(initial_config)
+                return
+              endif
+              t1=mpi_wtime()
+              minim_result=check_minim_cache(kmc,fingerprint,error=internal_error)
+              t2=mpi_wtime()
+              kmc%rate_cache_time=kmc%rate_cache_time+t2-t1
+              if (internal_error/=0) then
+                if (present(error)) error=internal_error
+                if (initial_config%initialised) call dealloc_atoms(initial_config)
+                return
+              endif
+              if (minim_result==MINIM_RESULT_FAIL) obstructed=.true.
+            else
+              minim_result=MINIM_RESULT_UNINIT
+            endif
+
+            resolved=.true.
+            event_ok=.false.
+            nan_detected=.false.
+            if (.not. obstructed) then
+              if (only_substrate_jump==SUBSTRATE_FCC_HCP .and. &
+                  kmc%substrate_fcc_hcp_barrier>=0.0_rk .and. kmc%substrate_hcp_fcc_barrier>=0.0_rk) then
+                barrier=kmc%substrate_fcc_hcp_barrier
+                reverse_barrier=kmc%substrate_hcp_fcc_barrier
+                event_ok=.true.
+              elseif (only_substrate_jump==SUBSTRATE_HCP_FCC .and. &
+                  kmc%substrate_fcc_hcp_barrier>=0.0_rk .and. kmc%substrate_hcp_fcc_barrier>=0.0_rk) then
+                barrier=kmc%substrate_hcp_fcc_barrier
+                reverse_barrier=kmc%substrate_fcc_hcp_barrier
+                event_ok=.true.
+              else
+                call batch_eval_soap(kmc,site_id,final_id,EVENT_TYPE_HOP,desc_fwd_vec,desc_rev_vec,&
+                                     cov_fwd,cov_rev,nan_detected,lae_index,internal_error)
+                if (internal_error/=0) then
+                  if (present(error)) error=internal_error
+                  if (initial_config%initialised) call dealloc_atoms(initial_config)
+                  return
+                endif
+                if (.not. nan_detected) then
+                  t1=mpi_wtime()
+                  if (.not. initial_config%initialised) initial_config=get_atoms(kmc%system)
+                  call prepare_barrier_or_queue(kmc,k,site_id,final_id,nn_final,fingerprint,minim_result,&
+                    desc_fwd_vec,desc_rev_vec,cov_fwd,cov_rev,initial_config,only_substrate_jump,&
+                    nn_atom,jump_shell,shell,0,0,resolved=resolved,forward_barrier=barrier,&
+                    reverse_barrier=reverse_barrier,event_ok=event_ok,pending=pending,n_pending=n_pending,&
+                    n_submit=n_submit,sub_fcc_hcp_item=sub_fcc_hcp_item,sub_hcp_fcc_item=sub_hcp_fcc_item,&
+                    error=internal_error)
+                  t2=mpi_wtime()
+                  kmc%get_barrier_time=kmc%get_barrier_time+t2-t1
+                  if (internal_error/=0) then
+                    if (present(error)) error=internal_error
+                    if (initial_config%initialised) call dealloc_atoms(initial_config)
+                    return
+                  endif
+                endif
+              endif
+            endif
+
+            if (resolved) then
+              t1=mpi_wtime()
+              if (obstructed .or. nan_detected .or. .not. event_ok) then
+                kmc%system%sites(site_id)%hop_states(nn_atom,jump_shell)=EVENT_FORBIDDEN
+              else
+                do nn_nn_atom=1,kmc%system%sites(final_id)%neighbour_shells(JUMP_SHELLS(1,cryst))%n_neighbour_sites
+                  nn_id=kmc%system%sites(final_id)%neighbour_shells(JUMP_SHELLS(1,cryst))%neighbour_sites(nn_nn_atom)
+                  if (kmc%system%sites(nn_id)%Z==0) call mark_atom_blocked(atom_blocked,atom_n_blocked,k,nn_id)
+                end do
+                barrier=max(0.0_rk,barrier)
+                if (barrier>0.0_rk) then
+                  reverse_barrier=max(0.0_rk,reverse_barrier)
+                else
+                  reverse_barrier=100.0_rk
+                endif
+                kmc%system%sites(site_id)%hop_barriers(1,nn_atom,jump_shell)=barrier
+                kmc%system%sites(site_id)%hop_barriers(2,nn_atom,jump_shell)=reverse_barrier
+                kmc%system%sites(site_id)%hop_rates(nn_atom,jump_shell)=&
+                  kmc%attempt_frequency*exp(-real(barrier,kind=dp)/kmc%kT)
+                kmc%system%sites(site_id)%hop_states(nn_atom,jump_shell)=EVENT_VALID
+                if (only_substrate_jump==SUBSTRATE_FCC_HCP) then
+                  if (kmc%substrate_fcc_hcp_barrier<0.0_rk .and. kmc%substrate_hcp_fcc_barrier<0.0_rk) then
+                    kmc%substrate_fcc_hcp_barrier=barrier
+                    kmc%substrate_hcp_fcc_barrier=reverse_barrier
+                  endif
+                elseif (only_substrate_jump==SUBSTRATE_HCP_FCC) then
+                  if (kmc%substrate_fcc_hcp_barrier<0.0_rk .and. kmc%substrate_hcp_fcc_barrier<0.0_rk) then
+                    kmc%substrate_hcp_fcc_barrier=barrier
+                    kmc%substrate_fcc_hcp_barrier=reverse_barrier
+                  endif
+                endif
+              endif
+              t2=mpi_wtime()
+              kmc%assigning_time=kmc%assigning_time+t2-t1
+            endif
+          end do
+        end do
+
+        if (n_pending>0) then
+          t1=mpi_wtime()
+          call flush_neb_batch(kmc,initial_config,pending,n_pending,n_submit,atom_blocked,atom_n_blocked,internal_error)
+          t2=mpi_wtime()
+          kmc%get_barrier_time=kmc%get_barrier_time+t2-t1
+          if (internal_error/=0) then
+            if (present(error)) error=internal_error
+            if (initial_config%initialised) call dealloc_atoms(initial_config)
+            return
+          endif
+        endif
+      end do
+
+      do k=1,n_unchecked
+        if (.not. locked_k(k)) then
+          site_id=unchecked_sites(k)
+          if (any(kmc%system%sites(site_id)%hop_states(:,:)==EVENT_LAE_CHANGED)) then
+            write(0,"(a,i0,a)") "*** Error: site ",site_id," has unchecked hop events in get_rates_swiftmd_batch()"
+            if (present(error)) error=1
+            if (initial_config%initialised) call dealloc_atoms(initial_config)
+            return
+          endif
+          kmc%system%sites(site_id)%hop_rate=sum(&
+            kmc%system%sites(site_id)%hop_rates(:,:),&
+            mask=kmc%system%sites(site_id)%hop_states(:,:)==EVENT_VALID)
+        endif
+      end do
+
+      if (allow_exchange) then
+        n_pending=0
+        n_submit=0
+        sub_fcc_hcp_item=0
+        sub_hcp_fcc_item=0
+        do k=1,n_unchecked
+          site_id=unchecked_sites(k)
+          n_neighbour_sites=kmc%system%sites(site_id)%neighbour_shells(:)%n_neighbour_sites
+          do initial_site=1,n_neighbour_sites(TRUE_1NN_SHELL(cryst))
+            t1=mpi_wtime()
+            initial_id=kmc%system%sites(site_id)%neighbour_shells(TRUE_1NN_SHELL(cryst))%neighbour_sites(initial_site)
+            if (kmc%system%sites(initial_id)%substrate .or. kmc%system%sites(initial_id)%Z<=0 .or. &
+                kmc%system%sites(initial_id)%locked) then
+              kmc%system%sites(site_id)%exchange_states(:,initial_site)=EVENT_FORBIDDEN
+              exch_states_k(:,initial_site,k)=EVENT_FORBIDDEN
+              t2=mpi_wtime()
+              kmc%event_finding_time=kmc%event_finding_time+t2-t1
+              cycle
+            endif
+            t2=mpi_wtime()
+            kmc%event_finding_time=kmc%event_finding_time+t2-t1
+
+            do final_site=1,n_neighbour_sites(TRUE_1NN_SHELL(cryst))
+              t1=mpi_wtime()
+              if (exch_states_k(final_site,initial_site,k)==EVENT_VALID .or. &
+                  exch_states_k(final_site,initial_site,k)==EVENT_FORBIDDEN) then
+                t2=mpi_wtime()
+                kmc%event_finding_time=kmc%event_finding_time+t2-t1
+                cycle
+              endif
+              final_id=kmc%system%sites(site_id)%neighbour_shells(TRUE_1NN_SHELL(cryst))%neighbour_sites(final_site)
+              nn_final=kmc%system%sites(final_id)%nn
+              do nn_atom=1,kmc%system%sites(initial_id)%neighbour_shells(TRUE_1NN_SHELL(cryst))%n_neighbour_sites
+                if (kmc%system%sites(initial_id)%neighbour_shells(TRUE_1NN_SHELL(cryst))%neighbour_sites(nn_atom)==final_id) then
+                  nn_final=nn_final-1
+                endif
+              end do
+              n_near_final=kmc%system%sites(final_id)%n_near
+              do s_chk=1,TRUE_1NN_SHELL(cryst)-1
+                do nn_atom=1,kmc%system%sites(initial_id)%neighbour_shells(s_chk)%n_neighbour_sites
+                  if (kmc%system%sites(initial_id)%neighbour_shells(s_chk)%neighbour_sites(nn_atom)==final_id) then
+                    n_near_final=n_near_final-1
+                  endif
+                end do
+              end do
+              obstructed=(kmc%system%sites(final_id)%Z/=0 .or. nn_final<N_NN_MIN(cryst) .or. n_near_final>0)
+              t2=mpi_wtime()
+              kmc%event_finding_time=kmc%event_finding_time+t2-t1
+
+              if (.not. obstructed) then
+                t1=mpi_wtime()
+                call create_fingerprint(kmc,site_id,final_id,fingerprint,initial_id=initial_id,error=internal_error)
+                t2=mpi_wtime()
+                kmc%rate_fingerprint_time=kmc%rate_fingerprint_time+t2-t1
+                if (internal_error/=0) then
+                  if (present(error)) error=internal_error
+                  if (initial_config%initialised) call dealloc_atoms(initial_config)
+                  return
+                endif
+                t1=mpi_wtime()
+                minim_result=check_minim_cache(kmc,fingerprint,error=internal_error)
+                t2=mpi_wtime()
+                kmc%rate_cache_time=kmc%rate_cache_time+t2-t1
+                if (internal_error/=0) then
+                  if (present(error)) error=internal_error
+                  if (initial_config%initialised) call dealloc_atoms(initial_config)
+                  return
+                endif
+                if (minim_result==MINIM_RESULT_FAIL) obstructed=.true.
+              endif
+
+              resolved=.true.
+              event_ok=.false.
+              nan_detected=.false.
+              if (.not. obstructed) then
+                call batch_eval_soap(kmc,site_id,final_id,EVENT_TYPE_EXCHANGE,desc_fwd_vec,desc_rev_vec,&
+                                     cov_fwd,cov_rev,nan_detected,lae_index,internal_error,initial_id=initial_id)
+                if (internal_error/=0) then
+                  if (present(error)) error=internal_error
+                  if (initial_config%initialised) call dealloc_atoms(initial_config)
+                  return
+                endif
+                if (.not. nan_detected) then
+                  t1=mpi_wtime()
+                  if (.not. initial_config%initialised) initial_config=get_atoms(kmc%system)
+                  call prepare_barrier_or_queue(kmc,k,site_id,final_id,nn_final,fingerprint,minim_result,&
+                    desc_fwd_vec,desc_rev_vec,cov_fwd,cov_rev,initial_config,SUBSTRATE_NOT,&
+                    0,0,0,initial_site,final_site,initial_id=initial_id,&
+                    resolved=resolved,forward_barrier=barrier,reverse_barrier=reverse_barrier,&
+                    event_ok=event_ok,pending=pending,n_pending=n_pending,n_submit=n_submit,&
+                    sub_fcc_hcp_item=sub_fcc_hcp_item,sub_hcp_fcc_item=sub_hcp_fcc_item,error=internal_error)
+                  t2=mpi_wtime()
+                  kmc%get_barrier_time=kmc%get_barrier_time+t2-t1
+                  if (internal_error/=0) then
+                    if (present(error)) error=internal_error
+                    if (initial_config%initialised) call dealloc_atoms(initial_config)
+                    return
+                  endif
+                endif
+              endif
+
+              if (resolved) then
+                t1=mpi_wtime()
+                if (obstructed .or. nan_detected .or. .not. event_ok) then
+                  kmc%system%sites(site_id)%exchange_states(final_site,initial_site)=EVENT_FORBIDDEN
+                else
+                  barrier=max(0.0_rk,barrier)
+                  if (barrier>0.0_rk) then
+                    reverse_barrier=max(0.0_rk,reverse_barrier)
+                  else
+                    reverse_barrier=100.0_rk
+                  endif
+                  kmc%system%sites(site_id)%exchange_barriers(1,final_site,initial_site)=barrier
+                  kmc%system%sites(site_id)%exchange_barriers(2,final_site,initial_site)=reverse_barrier
+                  kmc%system%sites(site_id)%exchange_rates(final_site,initial_site)=&
+                    kmc%attempt_frequency*exp(-real(barrier,kind=dp)/kmc%kT)
+                  kmc%system%sites(site_id)%exchange_states(final_site,initial_site)=EVENT_VALID
+                endif
+                t2=mpi_wtime()
+                kmc%assigning_time=kmc%assigning_time+t2-t1
+              endif
+            end do
+          end do
+        end do
+
+        if (n_pending>0) then
+          t1=mpi_wtime()
+          call flush_neb_batch(kmc,initial_config,pending,n_pending,n_submit,atom_blocked,atom_n_blocked,internal_error)
+          t2=mpi_wtime()
+          kmc%get_barrier_time=kmc%get_barrier_time+t2-t1
+          if (internal_error/=0) then
+            if (present(error)) error=internal_error
+            if (initial_config%initialised) call dealloc_atoms(initial_config)
+            return
+          endif
+        endif
+
+        do k=1,n_unchecked
+          site_id=unchecked_sites(k)
+          if (any(kmc%system%sites(site_id)%exchange_states(:,:)==EVENT_LAE_CHANGED)) then
+            write(0,"(a,i0,a)") "*** Error: site ",site_id," has unchecked exchange events in get_rates_swiftmd_batch()"
+            if (present(error)) error=1
+            if (initial_config%initialised) call dealloc_atoms(initial_config)
+            return
+          endif
+          kmc%system%sites(site_id)%exchange_rate=sum(&
+            kmc%system%sites(site_id)%exchange_rates(:,:),&
+            mask=kmc%system%sites(site_id)%exchange_states(:,:)==EVENT_VALID)
+          kmc%system%sites(site_id)%jumps_checked=.true.
+        end do
+      endif
+    endif
+
+    t1=mpi_wtime()
+    if (n_deposited>0) then
+      if (.not. allocated(dep_sorted)) then
+        allocate(dep_sorted(max(64,n_deposited)))
+      elseif (size(dep_sorted)<n_deposited) then
+        needed_cap=max(size(dep_sorted)*2,n_deposited)
+        deallocate(dep_sorted)
+        allocate(dep_sorted(needed_cap))
+      endif
+      dep_sorted(1:n_deposited)=kmc%system%deposited_atoms(1:n_deposited)
+      do k_dep=2,n_deposited
+        dep_key=dep_sorted(k_dep)
+        j_dep=k_dep-1
+        do while (j_dep>=1)
+          if (dep_sorted(j_dep)<=dep_key) exit
+          dep_sorted(j_dep+1)=dep_sorted(j_dep)
+          j_dep=j_dep-1
+        end do
+        dep_sorted(j_dep+1)=dep_key
+      end do
+      hop_sum=0.0_rk
+      exch_sum=0.0_rk
+      do k_dep=1,n_deposited
+        site_id=dep_sorted(k_dep)
+        hop_sum=hop_sum+kmc%system%sites(site_id)%hop_rate
+        if (allow_exchange) exch_sum=exch_sum+kmc%system%sites(site_id)%exchange_rate
+      end do
+    else
+      hop_sum=0.0_rk
+      exch_sum=0.0_rk
+    endif
+    kmc%total_rate=RATE_LOWERING_FACTOR**kmc%rate_lowered_times*hop_sum+sum(kmc%dep_rate)
+    if (allow_exchange) kmc%total_rate=kmc%total_rate+RATE_LOWERING_FACTOR**kmc%rate_lowered_times*exch_sum
+    if (initial_config%initialised) call dealloc_atoms(initial_config)
+    t2=mpi_wtime()
+    kmc%get_rates_overhead_time=kmc%get_rates_overhead_time+t2-t1
+  end subroutine get_rates_swiftmd_batch
+
   subroutine get_barrier(kmc,lmp,site_id,final_id,&
-                         nn_final_val,fingerprint,minim_result,desc_forward,desc_reverse,init,&
+                         nn_final_val,fingerprint,minim_result,desc_forward,desc_reverse,&
+                         cov_cutoff_forward,cov_cutoff_reverse,init,&
                          forward_barrier,reverse_barrier,event_ok,myrank,&
-                         initial_id,shell,error)
+                         initial_id,shell,cache_minim,error)
     type(t_kmc),intent(inout) :: kmc
     type(lammps),intent(inout) :: lmp
     integer,intent(in) :: site_id,final_id
     integer,intent(in) :: nn_final_val
     integer,intent(in) :: fingerprint(kmc%nZ,0:NN_SHELLS),minim_result
-    type(descriptor_data) :: desc_forward,desc_reverse
+    double precision,intent(in) :: desc_forward(:),desc_reverse(:)
+    double precision,intent(in) :: cov_cutoff_forward,cov_cutoff_reverse
     type(t_atoms),intent(inout) :: init
     real(kind=rk),intent(out) :: forward_barrier,reverse_barrier
     logical,intent(out) :: event_ok
     integer,intent(in) :: myrank
     integer,optional,intent(in) :: initial_id,shell
+    logical,optional,intent(in) :: cache_minim
     integer,optional,intent(out) :: error
 
     type(t_atoms) :: final_config,final_config_relaxed
@@ -1316,6 +2755,7 @@ contains
     double precision :: ml_forward_barrier,ml_reverse_barrier
     double precision :: forward_variance,reverse_variance
     real(kind=rk) :: displacement2
+    double precision :: swiftmd_ftol
     double precision,allocatable :: xdata(:)
     integer :: i,internal_error,worker_cmd
     double precision :: t1,t2
@@ -1328,12 +2768,18 @@ contains
     integer :: check_list(25),n_check_list,nn_atom,nn_id,id
     integer :: mpi_error
     logical :: forward_data_exists,reverse_data_exists,in_check_list
+    logical :: train_ok,use_minim_cache
 
     if (present(error)) then
       error=0
     endif
+    use_minim_cache=.true.
+    if (present(cache_minim)) use_minim_cache=cache_minim
     internal_error=0
     event_ok=.false.
+    train_ok=.false.
+    kmc%last_neb_forbid=.false.
+    kmc%last_neb_untrainable=.false.
 
     ml_tol2=kmc%ml_tol*kmc%ml_tol
     zero_tol=kmc%neb_error
@@ -1430,7 +2876,7 @@ contains
         if (kmc%hop_predictor(coord_jumping_forward,coord_target_forward,jump_shell)%fitted) then
           t1=mpi_wtime()
           call predict(kmc%hop_predictor(coord_jumping_forward,coord_target_forward,jump_shell),&
-                       desc_forward%x(1)%data(:),ml_forward_barrier,forward_variance,error=internal_error)
+                       desc_forward(:),ml_forward_barrier,forward_variance,error=internal_error)
           t2=mpi_wtime()
           kmc%predict_time=kmc%predict_time+t2-t1
           if (internal_error/=0) then
@@ -1442,7 +2888,7 @@ contains
           if (kmc%hop_predictor(coord_jumping_reverse,coord_target_reverse,jump_shell)%fitted) then
             t1=mpi_wtime()
             call predict(kmc%hop_predictor(coord_jumping_reverse,coord_target_reverse,jump_shell),&
-                         desc_reverse%x(1)%data(:),ml_reverse_barrier,reverse_variance,error=internal_error)
+                         desc_reverse(:),ml_reverse_barrier,reverse_variance,error=internal_error)
             t2=mpi_wtime()
             kmc%predict_time=kmc%predict_time+t2-t1
             if (internal_error/=0) then
@@ -1455,7 +2901,7 @@ contains
         if (kmc%exchange_predictor(coord_middle,coord_jumping_forward,coord_target_forward)%fitted) then
           t1=mpi_wtime()
           call predict(kmc%exchange_predictor(coord_middle,coord_jumping_forward,&
-                                              coord_target_forward),desc_forward%x(1)%data(:),&
+                                              coord_target_forward),desc_forward(:),&
                        ml_forward_barrier,forward_variance,error=internal_error)
           t2=mpi_wtime()
           kmc%predict_time=kmc%predict_time+t2-t1
@@ -1468,7 +2914,7 @@ contains
           if (kmc%exchange_predictor(coord_middle,coord_jumping_reverse,coord_target_reverse)%fitted) then
             t1=mpi_wtime()
             call predict(kmc%exchange_predictor(coord_middle,coord_jumping_reverse,&
-                                                coord_target_reverse),desc_reverse%x(1)%data(:),&
+                                                coord_target_reverse),desc_reverse(:),&
                          ml_reverse_barrier,reverse_variance,error=internal_error)
             t2=mpi_wtime()
             kmc%predict_time=kmc%predict_time+t2-t1
@@ -1505,9 +2951,9 @@ contains
     else
       if (.not. present(initial_id)) then ! hop event
           forward_data_exists=data_point_exists(kmc%hop_predictor(coord_jumping_forward,coord_target_forward,jump_shell),&
-                                                desc_forward%x(1)%data(:),y=neb_forward_barrier)
+                                                desc_forward(:),y=neb_forward_barrier)
           reverse_data_exists=data_point_exists(kmc%hop_predictor(coord_jumping_reverse,coord_target_reverse,jump_shell),&
-                                                desc_reverse%x(1)%data(:),y=neb_reverse_barrier)
+                                                desc_reverse(:),y=neb_reverse_barrier)
           forward_ml_full=kmc%hop_predictor(coord_jumping_forward,coord_target_forward,jump_shell)%n_y&
                             >=kmc%hop_predictor(coord_jumping_forward,coord_target_forward,jump_shell)%n_y_max
           reverse_ml_full=kmc%hop_predictor(coord_jumping_reverse,coord_target_reverse,jump_shell)%n_y&
@@ -1515,10 +2961,10 @@ contains
         else
           forward_data_exists=data_point_exists(kmc%exchange_predictor(coord_middle,coord_jumping_forward,&
                                                                        coord_target_forward),&
-                                                desc_forward%x(1)%data(:),y=neb_forward_barrier)
+                                                desc_forward(:),y=neb_forward_barrier)
           reverse_data_exists=data_point_exists(kmc%exchange_predictor(coord_middle,coord_jumping_reverse,&
                                                                        coord_target_reverse),&
-                                                desc_reverse%x(1)%data(:),y=neb_reverse_barrier)
+                                                desc_reverse(:),y=neb_reverse_barrier)
           forward_ml_full=kmc%exchange_predictor(coord_middle,coord_jumping_forward,coord_target_forward)%n_y&
                             >=kmc%exchange_predictor(coord_middle,coord_jumping_forward,coord_target_forward)%n_y_max
           reverse_ml_full=kmc%exchange_predictor(coord_middle,coord_jumping_reverse,coord_target_reverse)%n_y&
@@ -1568,12 +3014,14 @@ contains
             if (kmc%verbosity>=VERBOSITY_NORMAL) then
               write(6,"(a)") "# Minimizing final configuration..."
             endif
-            kmc%minim_cache_index=kmc%minim_cache_index+1
-            if (kmc%minim_cache_index>MINIM_CACHE_SIZE) then
-              kmc%minim_cache_index=1
+            if (use_minim_cache) then
+              kmc%minim_cache_index=kmc%minim_cache_index+1
+              if (kmc%minim_cache_index>MINIM_CACHE_SIZE) then
+                kmc%minim_cache_index=1
+              endif
+              kmc%minim_cache(:,:,kmc%minim_cache_index)=fingerprint
             endif
             ! Construct final_config lazily only when running minimization
-            kmc%minim_cache(:,:,kmc%minim_cache_index)=fingerprint
             final_config=init
             final_config%pos(:,kmc%system%sites(site_id)%id)=&
               kmc%system%sites(final_id)%cartesian_coords(:)
@@ -1581,25 +3029,41 @@ contains
               final_config%pos(:,kmc%system%sites(initial_id)%id)=&
                 kmc%system%sites(site_id)%cartesian_coords(:)
             endif
-            call lmp%create_atoms(id=[(i,i=kmc%system%substrate%first_id,kmc%system%substrate%last_id)],&
-                                  type=kmc%system%substrate%atom_type,&
-                                  x=reshape(real(kmc%system%substrate%pos,kind=dp),&
-                                  [3*(kmc%system%substrate%last_id-kmc%system%substrate%first_id+1)]))
-            call lmp%create_atoms(id=[(i,i=final_config%first_id,final_config%last_id)],&
-                                  type=final_config%atom_type,&
-                                  x=reshape(real(final_config%pos,kind=dp),[3*(final_config%last_id-final_config%first_id+1)]))
-            call lmp%command("group mobile subtract all frozen")
-            t1=mpi_wtime()
-            call lmp%command("minimize "//kmc%relax_tol//" "//0.1d0*kmc%relax_tol//" "//kmc%neb_steps//" "//10*kmc%neb_steps)
-            ! Increment minimizations counter by one
-            kmc%minimizations=kmc%minimizations+1
-            t2=mpi_wtime()
-            kmc%minimize_time=kmc%minimize_time+t2-t1
-            call lmp%gather_atoms_subset("x",3,[(i,i=final_config%first_id,final_config%last_id)],xdata)
-            call lmp%command("delete_atoms group mobile")
             final_config_relaxed=final_config
-            final_config_relaxed%pos=reshape(xdata,shape(final_config_relaxed%pos))
-            deallocate(xdata)
+            if (kmc%swiftmd%enabled) then
+              if (kmc%swiftmd%ftol_override>0.0d0) then
+                swiftmd_ftol=kmc%swiftmd%ftol_override
+              else
+                swiftmd_ftol=0.1d0*kmc%relax_tol
+              endif
+              t1=mpi_wtime()
+              call swiftmd_minimize_cfg(kmc%swiftmd,kmc%system,final_config,&
+                                        kmc%system%sites(final_id)%cartesian_coords(:),&
+                                        kmc%swiftmd%min_etol,swiftmd_ftol,0.1d0,kmc%neb_steps,&
+                                        final_config_relaxed%pos,internal_error)
+              kmc%minimizations=kmc%minimizations+1
+              t2=mpi_wtime()
+              kmc%minimize_time=kmc%minimize_time+t2-t1
+            else
+              call lmp%create_atoms(id=[(i,i=kmc%system%substrate%first_id,kmc%system%substrate%last_id)],&
+                                    type=kmc%system%substrate%atom_type,&
+                                    x=reshape(real(kmc%system%substrate%pos,kind=dp),&
+                                    [3*(kmc%system%substrate%last_id-kmc%system%substrate%first_id+1)]))
+              call lmp%create_atoms(id=[(i,i=final_config%first_id,final_config%last_id)],&
+                                    type=final_config%atom_type,&
+                                    x=reshape(real(final_config%pos,kind=dp),[3*(final_config%last_id-final_config%first_id+1)]))
+              call lmp%command("group mobile subtract all frozen")
+              t1=mpi_wtime()
+              call lmp%command("minimize "//kmc%relax_tol//" "//0.1d0*kmc%relax_tol//" "//kmc%neb_steps//" "//10*kmc%neb_steps)
+              ! Increment minimizations counter by one
+              kmc%minimizations=kmc%minimizations+1
+              t2=mpi_wtime()
+              kmc%minimize_time=kmc%minimize_time+t2-t1
+              call lmp%gather_atoms_subset("x",3,[(i,i=final_config%first_id,final_config%last_id)],xdata)
+              call lmp%command("delete_atoms group mobile")
+              final_config_relaxed%pos=reshape(xdata,shape(final_config_relaxed%pos))
+              deallocate(xdata)
+            endif
             n_check_list=1
             check_list(1)=kmc%system%sites(site_id)%id
             if (present(initial_id)) then
@@ -1666,14 +3130,18 @@ contains
             call dealloc_atoms(final_config_relaxed)
             if (displacement2<kmc%system%relax_displacement_tol2) then
               final_relaxed=.true.
-              kmc%minim_cache_results(kmc%minim_cache_index)=MINIM_RESULT_SUCCESS
+              if (use_minim_cache) then
+                kmc%minim_cache_results(kmc%minim_cache_index)=MINIM_RESULT_SUCCESS
+              endif
               if (kmc%verbosity>=VERBOSITY_NORMAL) then
                 write(6,"(a)") "# Final configuration minimized"
               endif
             else
               forward_barrier=100.0_rk
               reverse_barrier=100.0_rk
-              kmc%minim_cache_results(kmc%minim_cache_index)=MINIM_RESULT_FAIL
+              if (use_minim_cache) then
+                kmc%minim_cache_results(kmc%minim_cache_index)=MINIM_RESULT_FAIL
+              endif
               if (kmc%verbosity>=VERBOSITY_NORMAL) then
                 write(6,"(a)") "# Final configuration minimization failed:"
                 write(6,"(a)") "# too large displacement when relaxing the final configuration."
@@ -1690,9 +3158,11 @@ contains
           write(6,"(a)") "# Running NEB..."
         endif
         t1=mpi_wtime()
-        ! Wake workers only for actual NEB execution across all MPI ranks
-        worker_cmd=1
-        call mpi_bcast(worker_cmd,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
+        if (.not. kmc%swiftmd%enabled) then
+          ! Wake workers only for actual NEB execution across all MPI ranks
+          worker_cmd=1
+          call mpi_bcast(worker_cmd,1,MPI_INTEGER,0,MPI_COMM_WORLD,mpi_error)
+        endif
         if (.not. present(initial_id)) then
           call neb_barrier(kmc,lmp,site_id,final_id,init,&
                            neb_forward_barrier,neb_reverse_barrier,myrank)
@@ -1703,6 +3173,29 @@ contains
         endif
         t2=mpi_wtime()
         kmc%neb_barrier_time=kmc%neb_barrier_time+t2-t1
+        ! Paper (Kimari et al., Sec. 2): an improperly relaxing final state forbids the event and adds
+        ! no training data.
+        if (kmc%last_neb_forbid) then
+          ! Record the failure in the minimization cache exactly like a final-state minimization
+          ! failure, so get_rates() treats this environment as obstructed instead of re-running the
+          ! same NEB every time the event comes up (forbidden events add no ML data, so without the
+          ! cache the ML stays uncertain forever).
+          if (use_minim_cache) call mark_minim_cache_fail(kmc,fingerprint)
+          forward_barrier=100.0_rk
+          reverse_barrier=100.0_rk
+          event_ok=.false.
+          return
+        endif
+        if (neb_reverse_barrier<=0.0_rk) then
+          ! Final image is the top of the band: the final state is not a minimum along the path.
+          ! Same treatment as above (forbidden, no ML data, cached so it is not recomputed).
+          kmc%neb_forbidden=kmc%neb_forbidden+1
+          if (use_minim_cache) call mark_minim_cache_fail(kmc,fingerprint)
+          if (kmc%verbosity>=VERBOSITY_NORMAL) then
+            write(6,"(a,f9.5,a)") "# NEB: reverse barrier <= 0 (forward ",neb_forward_barrier,&
+              " eV), final state not a minimum: event forbidden and cached, no ML data"
+          endif
+        endif
       endif
       if (.not. forward_ml_full .or. .not. reverse_ml_full) then
           if (kmc%verbosity>=VERBOSITY_ABSURD) then
@@ -1714,13 +3207,16 @@ contains
           if (neb_reverse_barrier>0.0_rk) then
             event_ok=.true.
           endif
+          ! Paper (Sec. 2): train only on clean minimum-barrier-minimum NEB results. Forbidden events
+          ! (reverse barrier <= 0) and unconverged bands keep their KMC barrier but add no ML data.
+          train_ok=event_ok .and. .not. kmc%last_neb_untrainable
           if (.not. present(initial_id)) then ! hop event
             if (kmc%hop_predictor(coord_jumping_forward,coord_target_forward,jump_shell)%n_y<&
                 kmc%hop_predictor(coord_jumping_forward,coord_target_forward,jump_shell)%n_y_max &
-                .and. .not. forward_data_exists) then
+                .and. .not. forward_data_exists .and. train_ok) then
               call add_data_point(kmc%hop_predictor(coord_jumping_forward,coord_target_forward,jump_shell),&
-                                  desc_forward%x(1)%data(:),&
-                                  neb_forward_barrier,kmc%neb_error,desc_forward%x(1)%covariance_cutoff,error=internal_error)
+                                  desc_forward(:),&
+                                  neb_forward_barrier,kmc%neb_error,cov_cutoff_forward,error=internal_error)
               if (internal_error/=0) then
                 if (internal_error/=2) then
                   write(0,"(a)") "*** Error: couldn't add new data point to hop_predictor in get_barrier()"
@@ -1745,13 +3241,13 @@ contains
               endif
             endif
             reverse_data_exists=data_point_exists(kmc%hop_predictor(coord_jumping_reverse,coord_target_reverse,jump_shell),&
-                                                  desc_reverse%x(1)%data(:))
+                                                  desc_reverse(:))
             if (kmc%hop_predictor(coord_jumping_reverse,coord_target_reverse,jump_shell)%n_y<&
                 kmc%hop_predictor(coord_jumping_reverse,coord_target_reverse,jump_shell)%n_y_max &
-                .and. .not. reverse_data_exists) then
+                .and. .not. reverse_data_exists .and. train_ok) then
               call add_data_point(kmc%hop_predictor(coord_jumping_reverse,coord_target_reverse,jump_shell),&
-                                  desc_reverse%x(1)%data(:),&
-                                  neb_reverse_barrier,kmc%neb_error,desc_reverse%x(1)%covariance_cutoff,error=internal_error)
+                                  desc_reverse(:),&
+                                  neb_reverse_barrier,kmc%neb_error,cov_cutoff_reverse,error=internal_error)
               if (internal_error/=0) then
                 if (internal_error/=2) then
                   write(0,"(a)") "*** Error: couldn't add new data point to hop_predictor in get_barrier()"
@@ -1778,10 +3274,10 @@ contains
           else ! exchange event
             if (kmc%exchange_predictor(coord_middle,coord_jumping_forward,coord_target_forward)%n_y<&
                 kmc%exchange_predictor(coord_middle,coord_jumping_forward,coord_target_forward)%n_y_max &
-                .and. .not. forward_data_exists) then
+                .and. .not. forward_data_exists .and. train_ok) then
               call add_data_point(kmc%exchange_predictor(coord_middle,coord_jumping_forward,&
-                                                         coord_target_forward),desc_forward%x(1)%data(:),&
-                                  neb_forward_barrier,kmc%neb_error,desc_forward%x(1)%covariance_cutoff,error=internal_error)
+                                                         coord_target_forward),desc_forward(:),&
+                                  neb_forward_barrier,kmc%neb_error,cov_cutoff_forward,error=internal_error)
               if (internal_error/=0) then
                 if (internal_error/=2) then
                   write(0,"(a)") "*** Error: couldn't add new data point to hop_predictor in get_barrier()"
@@ -1808,13 +3304,13 @@ contains
             endif
             reverse_data_exists=data_point_exists(kmc%exchange_predictor(coord_middle,coord_jumping_reverse,&
                                                                          coord_target_reverse),&
-                                                  desc_reverse%x(1)%data(:))
+                                                  desc_reverse(:))
             if (kmc%exchange_predictor(coord_middle,coord_jumping_reverse,coord_target_reverse)%n_y<&
                 kmc%exchange_predictor(coord_middle,coord_jumping_reverse,coord_target_reverse)%n_y_max &
-                .and. .not. reverse_data_exists) then
+                .and. .not. reverse_data_exists .and. train_ok) then
               call add_data_point(kmc%exchange_predictor(coord_middle,coord_jumping_reverse,&
-                                                         coord_target_reverse),desc_reverse%x(1)%data(:),&
-                                  neb_reverse_barrier,kmc%neb_error,desc_reverse%x(1)%covariance_cutoff,error=internal_error)
+                                                         coord_target_reverse),desc_reverse(:),&
+                                  neb_reverse_barrier,kmc%neb_error,cov_cutoff_reverse,error=internal_error)
               if (internal_error/=0) then
                 if (internal_error/=2) then
                   write(0,"(a)") "*** Error: couldn't add new data point to hop_predictor in get_barrier()"
@@ -1857,14 +3353,20 @@ contains
     integer,intent(in) :: myrank
 
     integer :: i,first_id,last_id,nproc,jumping_atom_i,middle_atom_i
-    double precision :: pe
+    double precision :: pe,swiftmd_ftol
     integer,allocatable :: types(:)
     real(kind=rk),allocatable :: x(:,:)
     real(kind=rk),dimension(3) :: diff_init_target,diff_init_middle,diff_middle_target
     double precision,allocatable :: pe_all(:)
     character(len=512) :: cmds
-    integer :: mpi_error
-    
+    integer :: mpi_error,swiftmd_err,neb_conv
+    double precision :: neb_fmax,neb_jump_disp
+    double precision,parameter :: NEB_MIN_JUMP_DISP=0.5d0 ! A; below this the jump "relaxed back"
+
+    neb_fmax=0.0d0
+    neb_conv=1
+    neb_jump_disp=huge(1.0d0)
+
     if (myrank==0) then
       middle_atom_i=0
       if (present(initial_id)) then
@@ -1875,6 +3377,51 @@ contains
       else
         diff_init_target=system_diff_min_image(kmc%system,site_id,final_id)
         jumping_atom_i=kmc%system%sites(site_id)%id
+      endif
+
+      if (kmc%swiftmd%enabled) then
+        if (kmc%swiftmd%ftol_override>0.0d0) then
+          swiftmd_ftol=kmc%swiftmd%ftol_override
+        else
+          swiftmd_ftol=0.1d0*kmc%relax_tol
+        endif
+        call swiftmd_neb_cfg(kmc%swiftmd,kmc%system,init,jumping_atom_i,diff_init_target,&
+                             middle_atom_i,diff_init_middle,diff_middle_target,&
+                             kmc%neb_images,kmc%neb_spring,kmc%swiftmd%climb,&
+                             kmc%swiftmd%neb_etol,swiftmd_ftol,0.01d0,2*kmc%neb_steps,&
+                             barrier,reverse_barrier,swiftmd_err,&
+                             kmc_step=kmc%step,kmc_time=kmc%time,site_id=site_id,final_id=final_id,&
+                             fmax_res=neb_fmax,converged_res=neb_conv,jump_disp_res=neb_jump_disp)
+        if (swiftmd_err/=0 .or. neb_jump_disp<NEB_MIN_JUMP_DISP) then
+          if (swiftmd_err/=0) then
+            barrier=100.0_rk
+            reverse_barrier=-1.0_rk
+          endif
+          kmc%last_neb_forbid=.true.
+          kmc%last_neb_untrainable=.true.
+          kmc%neb_forbidden=kmc%neb_forbidden+1
+          if (kmc%verbosity>=VERBOSITY_NORMAL) then
+            write(6,"(a,f6.3,a,es10.3,a)") "# NEB: final state relaxed back to the initial one (jump ",&
+              neb_jump_disp," A, fmax=",neb_fmax," eV/A) or SwiftMD error: event forbidden and cached, no ML data"
+          endif
+        elseif (neb_conv==0 .and. kmc%neb_forbid_fmax>0.0d0 .and. neb_fmax>kmc%neb_forbid_fmax) then
+          kmc%last_neb_forbid=.true.
+          kmc%last_neb_untrainable=.true.
+          kmc%neb_forbidden=kmc%neb_forbidden+1
+          if (kmc%verbosity>=VERBOSITY_NORMAL) then
+            write(6,"(a,es10.3,a,f9.5,a)") "# NEB unconverged above forbid limit (fmax=",neb_fmax,&
+              " eV/A, barrier=",barrier," eV): event forbidden and cached, no ML data"
+          endif
+        elseif (neb_conv==0 .and. kmc%neb_reject_fmax>0.0d0 .and. neb_fmax>kmc%neb_reject_fmax) then
+          kmc%last_neb_untrainable=.true.
+          kmc%neb_untrainable=kmc%neb_untrainable+1
+          if (kmc%verbosity>=VERBOSITY_NORMAL) then
+            write(6,"(a,es10.3,a,f9.5,a)") "# NEB not converged (fmax=",neb_fmax,&
+              " eV/A): barrier ",barrier," eV used in KMC, not added to ML data"
+          endif
+        endif
+        kmc%neb_calculations=kmc%neb_calculations+1
+        return
       endif
 
       nproc=kmc%neb_images
@@ -2070,7 +3617,7 @@ contains
     integer :: i,nn_atom,shell,final_site,initial_site,id,reverse_nn_atom,saved_reverse_nn_atom
     integer :: final_id,initial_id,nn_id,nn_nn_id
     integer :: nn_shell,nn_nn_atom,jump_shell
-    integer :: nn_initial,nn_mid,nn_final,fingerprint(kmc%nZ,0:NN_SHELLS),minim_result
+    integer :: nn_initial,nn_mid,nn_final,fingerprint(kmc%nZ,0:NN_SHELLS),minim_result,only_substrate_jump
     real(kind=rk) :: barrier,reverse_barrier
     double precision :: t1,t2
     integer :: internal_error
@@ -2562,22 +4109,31 @@ contains
       jump_shell=NN_SHELL_TO_JUMP_SHELL(shell,kmc%system%crystal_structure)
 
       ! Reverse jump validity
-      ! Check minimization cache for a hit of initial state minimization
-      t1=mpi_wtime()
-      call create_fingerprint(kmc,final_id,site_id,fingerprint,error=internal_error)
-      t2=mpi_wtime()
-      kmc%event_fingerprint_time=kmc%event_fingerprint_time+t2-t1
-      if (internal_error/=0) then
-        write(0,"(a)") "*** Error getting fingerprint in execute_jump_event()"
-        return
+      ! Check minimization cache for a hit of initial state minimization (skip for bare-terrace hops)
+      only_substrate_jump=SUBSTRATE_NOT
+      if (kmc%system%crystal_structure==CRYSTAL_STRUCTURE_CLOSE_PACKED .and. &
+          kmc%system%orientation==ORIENTATION_111) then
+        call only_substrate_lae(kmc,final_id,site_id,only_substrate_jump,error=internal_error)
       endif
-      t1=mpi_wtime()
-      minim_result=check_minim_cache(kmc,fingerprint,error=internal_error)
-      t2=mpi_wtime()
-      kmc%event_cache_time=kmc%event_cache_time+t2-t1
-      if (internal_error/=0) then
-        write(0,"(a)") "*** Error getting fingerprint in execute_jump_event()"
-        return
+      if (only_substrate_jump/=SUBSTRATE_NOT) then
+        minim_result=MINIM_RESULT_SUCCESS
+      else
+        t1=mpi_wtime()
+        call create_fingerprint(kmc,final_id,site_id,fingerprint,jump_shell=jump_shell,error=internal_error)
+        t2=mpi_wtime()
+        kmc%event_fingerprint_time=kmc%event_fingerprint_time+t2-t1
+        if (internal_error/=0) then
+          write(0,"(a)") "*** Error getting fingerprint in execute_jump_event()"
+          return
+        endif
+        t1=mpi_wtime()
+        minim_result=check_minim_cache(kmc,fingerprint,error=internal_error)
+        t2=mpi_wtime()
+        kmc%event_cache_time=kmc%event_cache_time+t2-t1
+        if (internal_error/=0) then
+          write(0,"(a)") "*** Error getting fingerprint in execute_jump_event()"
+          return
+        endif
       endif
       if (minim_result/=MINIM_RESULT_FAIL) then
         kmc%system%sites(final_id)%hop_states(saved_reverse_nn_atom,jump_shell)=EVENT_VALID
@@ -2741,17 +4297,38 @@ contains
     double precision :: t1,t2
     integer :: internal_error
     integer :: nn_atom,shell
-    integer :: nn_id,Z
-    logical,allocatable :: jumping(:)
-    logical,allocatable :: lae_mask(:)
+    integer :: nn_id,Z,n_lae,cap,needed_cap,new_cap
+    logical,allocatable,save :: lae_mask(:),lae_jumping_buf(:)
+    integer,allocatable,save :: lae_visited(:),lae_z_buf(:)
+    real(dp),allocatable,save :: lae_pos_buf(:,:)
+    logical,allocatable :: tmp_mask(:)
+    integer,allocatable :: tmp_int(:)
+    real(dp),allocatable :: tmp_pos(:,:)
 
     if (present(error)) then
       error=0
     endif
     internal_error=0
 
-    allocate(lae_mask(kmc%system%n_sites))
-    lae_mask=.false.
+    if (.not. allocated(lae_mask)) then
+      needed_cap=max(kmc%system%n_sites+1024,1024)
+      allocate(lae_mask(needed_cap))
+      lae_mask=.false.
+    elseif (size(lae_mask)<kmc%system%n_sites) then
+      needed_cap=max(kmc%system%n_sites+1024,size(lae_mask)*2)
+      allocate(tmp_mask(needed_cap))
+      tmp_mask=.false.
+      call move_alloc(tmp_mask,lae_mask)
+    endif
+
+    if (.not. allocated(lae_z_buf)) then
+      cap=512
+      allocate(lae_pos_buf(3,cap),lae_z_buf(cap),lae_visited(cap),lae_jumping_buf(cap))
+      lae_jumping_buf=.false.
+      lae_jumping_buf(1)=.true.
+    else
+      cap=size(lae_z_buf)
+    endif
 
     t1=mpi_wtime()
     call initialise(lae,0,real(kmc%system%lattice,kind=dp))
@@ -2759,94 +4336,195 @@ contains
     kmc%lae_init_time=kmc%lae_init_time+t2-t1
 
     t1=mpi_wtime()
+    n_lae=0
     if (jump_type==EVENT_TYPE_EXCHANGE) then
-      call add_atoms(lae,real(kmc%system%sites(initial_id)%cartesian_coords(:),kind=dp),&
-                     kmc%system%sites(initial_id)%Z)
-      lae_mask(initial_id)=.true.
+      call append_lae_atom(real(kmc%system%sites(initial_id)%cartesian_coords(:),kind=dp),kmc%system%sites(initial_id)%Z,initial_id)
+    endif
+    call append_lae_atom(real(kmc%system%sites(site_id)%cartesian_coords(:),kind=dp),kmc%system%sites(site_id)%Z,site_id)
+
+    call collect_lae_shell_neighbors(site_id)
+    call collect_lae_shell_neighbors(final_id)
+    if (jump_type==EVENT_TYPE_EXCHANGE) then
+      call collect_lae_shell_neighbors(initial_id)
     endif
 
-    call add_atoms(lae,real(kmc%system%sites(site_id)%cartesian_coords(:),kind=dp),kmc%system%sites(site_id)%Z)
-    lae_mask(site_id)=.true.
-
-    ! Neighbourhood of site_id
-    t1=mpi_wtime()
-    do shell=TRUE_1NN_SHELL(kmc%system%crystal_structure),kmc%system%lae_cutoff_shell
-      do nn_atom=1,kmc%system%sites(site_id)%neighbour_shells(shell)%n_neighbour_sites
-        nn_id=kmc%system%sites(site_id)%neighbour_shells(shell)%neighbour_sites(nn_atom)
-        if (kmc%system%sites(nn_id)%Z>0) then
-          if (.not. lae_mask(nn_id)) then
-            ! If modelling weakly-interacting substrate, add substrate atoms with dummy atomic number
-            if (kmc%system%sites(nn_id)%substrate .and. kmc%system%substrate_type==SUBSTRATE_TYPE_WEAK) then
-              Z=SUBSTRATE_Z
-            else
-              Z=kmc%system%sites(nn_id)%Z
-            endif
-            call add_atoms(lae,real(kmc%system%sites(nn_id)%cartesian_coords(:),kind=dp),Z)
-            lae_mask(nn_id)=.true.
-          endif
-        endif
-      end do
+    do nn_atom=1,n_lae
+      lae_mask(lae_visited(nn_atom))=.false.
     end do
 
-    ! Neighbourhood of final_id
-    do shell=TRUE_1NN_SHELL(kmc%system%crystal_structure),kmc%system%lae_cutoff_shell
-      do nn_atom=1,kmc%system%sites(final_id)%neighbour_shells(shell)%n_neighbour_sites
-        nn_id=kmc%system%sites(final_id)%neighbour_shells(shell)%neighbour_sites(nn_atom)
-        if (kmc%system%sites(nn_id)%Z>0) then
-          if (.not. lae_mask(nn_id)) then
-            ! If modelling weakly-interacting substrate, add substrate atoms with dummy atomic number
-            if (kmc%system%sites(nn_id)%substrate .and. kmc%system%substrate_type==SUBSTRATE_TYPE_WEAK) then
-              Z=SUBSTRATE_Z
-            else
-              Z=kmc%system%sites(nn_id)%Z
-            endif
-            call add_atoms(lae,real(kmc%system%sites(nn_id)%cartesian_coords(:),kind=dp),Z)
-            lae_mask(nn_id)=.true.
-          endif
-        endif
-      end do
-    end do
-
-    if (jump_type==EVENT_TYPE_EXCHANGE) then
-      ! Neighbourhood of initial_id
-      do shell=TRUE_1NN_SHELL(kmc%system%crystal_structure),kmc%system%lae_cutoff_shell
-        do nn_atom=1,kmc%system%sites(initial_id)%neighbour_shells(shell)%n_neighbour_sites
-          nn_id=kmc%system%sites(initial_id)%neighbour_shells(shell)%neighbour_sites(nn_atom)
-          if (kmc%system%sites(nn_id)%Z>0) then
-            if (.not. lae_mask(nn_id)) then
-              ! If modelling weakly-interacting substrate, add substrate atoms with dummy atomic number
-              if (kmc%system%sites(nn_id)%substrate .and. kmc%system%substrate_type==SUBSTRATE_TYPE_WEAK) then
-                Z=SUBSTRATE_Z
-              else
-                Z=kmc%system%sites(nn_id)%Z
-              endif
-              call add_atoms(lae,real(kmc%system%sites(nn_id)%cartesian_coords(:),kind=dp),Z)
-              lae_mask(nn_id)=.true.
-            endif
-          endif
-        end do
-      end do
-    endif
+    call add_atoms(lae,lae_pos_buf(:,1:n_lae),lae_z_buf(1:n_lae),error=internal_error)
     t2=mpi_wtime()
     kmc%lae_add_time=kmc%lae_add_time+t2-t1
 
-    allocate(jumping(lae%N))
-    jumping=.false.
-    jumping(1)=.true.
     if (present(jumping_ptr)) then
-      call add_property(lae,"jumping",jumping,ptr=jumping_ptr)
+      call add_property(lae,"jumping",lae_jumping_buf(1:n_lae),ptr=jumping_ptr)
     else
-      call add_property(lae,"jumping",jumping)
+      call add_property(lae,"jumping",lae_jumping_buf(1:n_lae))
     endif
-    deallocate(jumping)
-    deallocate(lae_mask)
     call set_cutoff(lae,cutoff(kmc%desc))
     t1=mpi_wtime()
-    call calc_connect(lae)
+    call calc_connect_atom(lae,1,error=internal_error)
     t2=mpi_wtime()
     kmc%lae_connect_time=kmc%lae_connect_time+t2-t1
 
+  contains
+
+    subroutine append_lae_atom(pos,z_val,site_idx)
+      real(dp),intent(in) :: pos(3)
+      integer,intent(in) :: z_val,site_idx
+
+      n_lae=n_lae+1
+      if (n_lae>cap) then
+        new_cap=cap*2
+        allocate(tmp_pos(3,new_cap))
+        tmp_pos(:,1:cap)=lae_pos_buf
+        call move_alloc(tmp_pos,lae_pos_buf)
+        allocate(tmp_int(new_cap))
+        tmp_int(1:cap)=lae_z_buf
+        call move_alloc(tmp_int,lae_z_buf)
+        allocate(tmp_int(new_cap))
+        tmp_int(1:cap)=lae_visited
+        call move_alloc(tmp_int,lae_visited)
+        allocate(tmp_mask(new_cap))
+        tmp_mask=.false.
+        tmp_mask(1)=.true.
+        call move_alloc(tmp_mask,lae_jumping_buf)
+        cap=new_cap
+      endif
+      lae_pos_buf(:,n_lae)=pos
+      lae_z_buf(n_lae)=z_val
+      lae_visited(n_lae)=site_idx
+      lae_mask(site_idx)=.true.
+    end subroutine append_lae_atom
+
+    subroutine collect_lae_shell_neighbors(center_id)
+      integer,intent(in) :: center_id
+      integer :: sh,k_atom,nb_id,nb_z
+
+      do sh=TRUE_1NN_SHELL(kmc%system%crystal_structure),kmc%system%lae_cutoff_shell
+        do k_atom=1,kmc%system%sites(center_id)%neighbour_shells(sh)%n_neighbour_sites
+          nb_id=kmc%system%sites(center_id)%neighbour_shells(sh)%neighbour_sites(k_atom)
+          if (kmc%system%sites(nb_id)%Z>0 .and. .not. lae_mask(nb_id)) then
+            if (kmc%system%sites(nb_id)%substrate .and. kmc%system%substrate_type==SUBSTRATE_TYPE_WEAK) then
+              nb_z=SUBSTRATE_Z
+            else
+              nb_z=kmc%system%sites(nb_id)%Z
+            endif
+            call append_lae_atom(real(kmc%system%sites(nb_id)%cartesian_coords(:),kind=dp),nb_z,nb_id)
+          endif
+        end do
+      end do
+    end subroutine collect_lae_shell_neighbors
+
   end subroutine get_jump_lae
+
+  ! Zero-QUIP LAE builder directly into persistent contiguous buffers for JGAP jgap_soap_eval_lae.
+  subroutine get_jump_lae_buf(kmc,site_id,final_id,jump_type,n_lae,pos_buf,z_buf,initial_id)
+    type(t_kmc),intent(in) :: kmc
+    integer,intent(in) :: site_id,final_id,jump_type
+    integer,intent(out) :: n_lae
+    real(c_double),allocatable,intent(inout) :: pos_buf(:,:)
+    integer(c_int),allocatable,intent(inout) :: z_buf(:)
+    integer,optional,intent(in) :: initial_id
+
+    logical,allocatable,save :: lae_mask(:)
+    integer,allocatable,save :: lae_visited(:)
+    logical,allocatable :: tmp_mask(:)
+    integer,allocatable :: tmp_vis(:)
+    real(c_double),allocatable :: tmp_pos(:,:)
+    integer(c_int),allocatable :: tmp_z(:)
+    integer :: cap,needed_cap,new_cap,i
+
+    if (.not. allocated(lae_mask)) then
+      needed_cap=max(kmc%system%n_sites+1024,1024)
+      allocate(lae_mask(needed_cap))
+      lae_mask=.false.
+    elseif (size(lae_mask)<kmc%system%n_sites) then
+      needed_cap=max(kmc%system%n_sites+1024,size(lae_mask)*2)
+      allocate(tmp_mask(needed_cap))
+      tmp_mask=.false.
+      call move_alloc(tmp_mask,lae_mask)
+    endif
+
+    if (.not. allocated(z_buf)) then
+      cap=512
+      allocate(pos_buf(3,cap),z_buf(cap))
+    else
+      cap=size(z_buf)
+    endif
+    if (.not. allocated(lae_visited)) then
+      allocate(lae_visited(cap))
+    elseif (size(lae_visited)<cap) then
+      deallocate(lae_visited)
+      allocate(lae_visited(cap))
+    endif
+
+    n_lae=0
+    if (jump_type==EVENT_TYPE_EXCHANGE) then
+      call append_atom(real(kmc%system%sites(initial_id)%cartesian_coords(:),c_double),&
+                       int(kmc%system%sites(initial_id)%Z,c_int),initial_id)
+    endif
+    call append_atom(real(kmc%system%sites(site_id)%cartesian_coords(:),c_double),&
+                     int(kmc%system%sites(site_id)%Z,c_int),site_id)
+
+    call collect_neighbors(site_id)
+    call collect_neighbors(final_id)
+    if (jump_type==EVENT_TYPE_EXCHANGE) then
+      call collect_neighbors(initial_id)
+    endif
+
+    do i=1,n_lae
+      lae_mask(lae_visited(i))=.false.
+    end do
+
+  contains
+
+    subroutine append_atom(pos,z_val,site_idx)
+      real(c_double),intent(in) :: pos(3)
+      integer(c_int),intent(in) :: z_val
+      integer,intent(in) :: site_idx
+
+      n_lae=n_lae+1
+      if (n_lae>cap) then
+        new_cap=cap*2
+        allocate(tmp_pos(3,new_cap))
+        tmp_pos(:,1:cap)=pos_buf
+        call move_alloc(tmp_pos,pos_buf)
+        allocate(tmp_z(new_cap))
+        tmp_z(1:cap)=z_buf
+        call move_alloc(tmp_z,z_buf)
+        allocate(tmp_vis(new_cap))
+        tmp_vis(1:cap)=lae_visited(1:cap)
+        call move_alloc(tmp_vis,lae_visited)
+        cap=new_cap
+      endif
+      pos_buf(:,n_lae)=pos
+      z_buf(n_lae)=z_val
+      lae_visited(n_lae)=site_idx
+      lae_mask(site_idx)=.true.
+    end subroutine append_atom
+
+    subroutine collect_neighbors(center_id)
+      integer,intent(in) :: center_id
+      integer :: sh,k_atom,nb_id
+      integer(c_int) :: nb_z
+
+      do sh=TRUE_1NN_SHELL(kmc%system%crystal_structure),kmc%system%lae_cutoff_shell
+        do k_atom=1,kmc%system%sites(center_id)%neighbour_shells(sh)%n_neighbour_sites
+          nb_id=kmc%system%sites(center_id)%neighbour_shells(sh)%neighbour_sites(k_atom)
+          if (kmc%system%sites(nb_id)%Z>0 .and. .not. lae_mask(nb_id)) then
+            if (kmc%system%sites(nb_id)%substrate .and. kmc%system%substrate_type==SUBSTRATE_TYPE_WEAK) then
+              nb_z=int(SUBSTRATE_Z,c_int)
+            else
+              nb_z=int(kmc%system%sites(nb_id)%Z,c_int)
+            endif
+            call append_atom(real(kmc%system%sites(nb_id)%cartesian_coords(:),c_double),nb_z,nb_id)
+          endif
+        end do
+      end do
+    end subroutine collect_neighbors
+
+  end subroutine get_jump_lae_buf
 
   subroutine only_substrate_lae(kmc,site_id,final_id,jump_type,error)
     type(t_kmc),intent(inout) :: kmc
@@ -3363,11 +5041,11 @@ contains
 
   end subroutine read_my_restart
 
-  subroutine create_fingerprint(kmc,site_id,final_id,fingerprint,initial_id,error)
+  subroutine create_fingerprint(kmc,site_id,final_id,fingerprint,initial_id,jump_shell,error)
     type(t_kmc),intent(in) :: kmc
     integer,intent(in) :: site_id,final_id
     integer,intent(out) :: fingerprint(kmc%nZ,0:NN_SHELLS)
-    integer,optional,intent(in) :: initial_id
+    integer,optional,intent(in) :: initial_id,jump_shell
     integer,optional,intent(out) :: error
     
     integer :: nn_atom,nn_id,shell,internal_error
@@ -3379,8 +5057,12 @@ contains
 
     fingerprint=0
 
-    ! The zeroth identifier is the species of the jumping atom, now at final_id
-    fingerprint(kmc%system%sites(site_id)%atom_type,0)=1
+    ! The zeroth identifier encodes species + jump_shell (so long-hop failures cannot poison short hops)
+    if (present(jump_shell)) then
+      fingerprint(kmc%system%sites(site_id)%atom_type,0)=1+10*jump_shell
+    else
+      fingerprint(kmc%system%sites(site_id)%atom_type,0)=1
+    endif
 
     do shell=1,NN_SHELLS
       do nn_atom=1,kmc%system%sites(final_id)%neighbour_shells(shell)%n_neighbour_sites
@@ -3439,6 +5121,24 @@ contains
 
   end function check_minim_cache
 
+  ! Marks the minimization-cache entry for this fingerprint as failed (adds one if missing), so the
+  ! event is treated as obstructed from now on. Used when the NEB shows the final state is not stable.
+  subroutine mark_minim_cache_fail(kmc,fingerprint)
+    type(t_kmc),intent(inout) :: kmc
+    integer,intent(in) :: fingerprint(kmc%nZ,0:NN_SHELLS)
+    integer :: k
+    do k=1,MINIM_CACHE_SIZE
+      if (all(kmc%minim_cache(:,:,k)==fingerprint)) then
+        kmc%minim_cache_results(k)=MINIM_RESULT_FAIL
+        return
+      endif
+    end do
+    kmc%minim_cache_index=kmc%minim_cache_index+1
+    if (kmc%minim_cache_index>MINIM_CACHE_SIZE) kmc%minim_cache_index=1
+    kmc%minim_cache(:,:,kmc%minim_cache_index)=fingerprint
+    kmc%minim_cache_results(kmc%minim_cache_index)=MINIM_RESULT_FAIL
+  end subroutine mark_minim_cache_fail
+
   subroutine write_output_line(kmc,error)
     type(t_kmc),intent(in) :: kmc
     integer,optional,intent(out) :: error
@@ -3467,6 +5167,7 @@ contains
       write(6,"(i12,i14)",advance="no") kmc%neb_calculations,kmc%minimizations
     endif
     write(6,*)
+    flush(6)
 
   end subroutine write_output_line
 
